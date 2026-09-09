@@ -26,6 +26,7 @@ except Exception:
     HAVE_PIL = False
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.dirname(APP_DIR)  # repo root, holds recon_functions_all.py etc.
 DRIVER = os.path.join(APP_DIR, "pipeline_driver.py")
 
 # The notebook's kernel ("mi-env") - see Automated-FMIG-Rat.ipynb metadata
@@ -295,7 +296,7 @@ class App(tk.Tk):
         try:
             self.proc = subprocess.Popen(
                 cmd,
-                cwd=PIPELINE_DIR,
+                cwd=REPO_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
