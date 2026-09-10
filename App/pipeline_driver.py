@@ -112,10 +112,9 @@ def step_3(main_dir, corr_dir, marign=75, threshold=0.5):
             coronal_tiff_path,
             CHECKPOINT=r"C:\Users\milabs\Desktop\Pipeline\Rat-lung-segmentation-from-xray\checkpoints\best_model.pt")
 
-    threshold = 0.5
     plt.figure(figsize=(15, 5))
     plt.subplot(1, 2, 1)
-    im = get_image(corr_dir, slice_num=coronal_slice_num, normalize=True, threshold=.5)
+    im = get_image(corr_dir, slice_num=coronal_slice_num, normalize=True, threshold=threshold)
 
     plt.imshow(im, cmap='gray')
     plt.imshow(mask_pred_coronal, cmap="jet", alpha=0.25 * mask_pred, vmin=0, vmax=1)
@@ -175,8 +174,7 @@ def clean_study_folder(session):
             pt = True
     print()
             
-def MI_reconstruction(main_dir):
-    threshold = 0.5
+def MI_reconstruction(main_dir, threshold=0.5):
     corr_dir = os.path.join(main_dir, 'ct-data', 'corr')
     check_timing(main_dir)
     step_2(main_dir)
@@ -406,11 +404,11 @@ outname = 'Optimized_Reconstruction-MI'
 # --------------------------------------------------------------------------
 
 
-def run(main_dir, steps):
+def run(main_dir, steps, threshold=0.5):
     if "recon" in steps:
         log_step("recon")
         try:
-            MI_reconstruction(main_dir)
+            MI_reconstruction(main_dir, threshold=threshold)
         except Exception as e:
             log_failed("recon", e)
             return 1
@@ -457,6 +455,9 @@ def main():
     parser.add_argument("main_dir", help=r'Data folder, e.g. D:\Data\Txk5\2026-08-06_10h47')
     parser.add_argument("--steps", default=",".join(STEP_ORDER),
                          help="Comma-separated subset of: " + ",".join(STEP_ORDER))
+    parser.add_argument("--threshold", type=float, default=0.5,
+                         help="Projection segmentation threshold in (0, 1] used when "
+                              "extracting the breathing signal for gated recon. Default 0.5.")
     args = parser.parse_args()
 
     main_dir = args.main_dir
@@ -469,9 +470,16 @@ def main():
         print(f"main_dir does not exist: {main_dir}", file=sys.stderr)
         return 2
 
+    threshold = args.threshold
+    if not (0.0 < threshold <= 1.0):
+        clamped = min(1.0, max(0.01, threshold))
+        print(f"threshold {threshold} out of range (0, 1] - using {clamped}", file=sys.stderr)
+        threshold = clamped
+
     print(f"main_dir = {main_dir}")
     print(f"steps = {steps}")
-    return run(main_dir, steps)
+    print(f"threshold = {threshold}")
+    return run(main_dir, steps, threshold=threshold)
 
 
 if __name__ == "__main__":

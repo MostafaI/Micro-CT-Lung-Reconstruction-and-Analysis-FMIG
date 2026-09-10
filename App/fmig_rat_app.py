@@ -36,6 +36,12 @@ MI_ENV_PYTHON = r"C:\Users\milabs\.conda\envs\mi-env\python.exe"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", APP_DIR), "FMIGRatApp")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
+# Projection segmentation threshold: pixels brighter than this (on a 0-1 scale)
+# are dropped before the breathing signal is measured from the projections.
+# 0.5 is the default for every folder; a per-folder override is stored under
+# cfg["thresholds"][<normalized path>] once the user sets one via Check Threshold.
+DEFAULT_THRESHOLD = 0.5
+
 # RTKRecon is a separate, non-GitHub component that always lives under
 # Desktop/Pipeline directly - not a sibling of this file, since this file
 # ships inside the Micro-CT-Lung-Reconstruction-and-Analysis-FMIG repo.
@@ -68,6 +74,88 @@ def save_config(cfg):
             json.dump(cfg, f)
     except Exception:
         pass
+
+
+class ThresholdDialog(tk.Toplevel):
+    """Preview one projection with the segmentation threshold applied and let
+    the user pick a value in (0, 1]. After it closes, self.result holds the
+    chosen float, or None if the user cancelled."""
+
+    PREVIEW_W = 520
+
+    def __init__(self, parent, tiff_path, current=DEFAULT_THRESHOLD):
+        super().__init__(parent)
+        self.title("Check segmentation threshold")
+        self.resizable(False, False)
+        self.result = None
+
+        try:
+            import numpy as np
+            self._np = np
+            self._raw = np.asarray(Image.open(tiff_path)).astype(np.uint16) / 65535.0
+        except Exception as e:
+            messagebox.showerror("Check segmentation threshold",
+                                 f"Could not load the projection image:\n{tiff_path}\n\n{e}",
+                                 parent=parent)
+            self.destroy()
+            return
+
+        h, w = self._raw.shape[:2]
+        self._disp_size = (self.PREVIEW_W, max(1, int(round(h * self.PREVIEW_W / float(w)))))
+
+        ttk.Label(self, text=os.path.basename(tiff_path), foreground="gray").pack(padx=10, pady=(10, 2))
+        self._img_label = ttk.Label(self)
+        self._img_label.pack(padx=10)
+        ttk.Label(self,
+                  text="Pixels brighter than the threshold are removed before the breathing "
+                       "signal is measured from the projections.",
+                  foreground="gray", wraplength=self.PREVIEW_W, justify="left").pack(padx=10, pady=(6, 0))
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Label(row, text="Threshold").pack(side="left")
+        self._val_var = tk.StringVar()
+        ttk.Label(row, textvariable=self._val_var, width=6, anchor="e").pack(side="right")
+        self._scale = tk.Scale(self, from_=0.0, to=1.0, resolution=0.01,
+                                orient="horizontal", showvalue=False, command=self._on_scale)
+        self._scale.set(float(current))
+        self._scale.pack(fill="x", padx=10)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Use this threshold", command=self._ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+
+        self._render(float(current))
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.transient(parent)
+        self.grab_set()
+        self._scale.focus_set()
+        self.wait_window(self)
+
+    def _on_scale(self, _value):
+        self._render(self._scale.get())
+
+    def _render(self, t):
+        np = self._np
+        self._val_var.set(f"{t:.2f}")
+        m = self._raw.copy()
+        if t > 0:
+            m[m > t] = 0.0
+            disp = np.clip(m / t, 0.0, 1.0)
+        else:
+            disp = np.zeros_like(m)
+        im = Image.fromarray((disp * 255).astype("uint8")).resize(self._disp_size)
+        self._photo = ImageTk.PhotoImage(im)  # keep a reference alive
+        self._img_label.config(image=self._photo)
+
+    def _ok(self):
+        self.result = round(float(self._scale.get()), 2)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class App(tk.Tk):
@@ -149,9 +237,14 @@ class App(tk.Tk):
         self.run_btn.pack(side="left")
         self.stop_btn = ttk.Button(btns, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
+        self.thresh_btn = ttk.Button(btns, text="Check Threshold", command=self._check_threshold)
+        self.thresh_btn.pack(side="left", padx=6)
         ttk.Button(btns, text="Open Output Folder", command=self._open_output_folder).pack(side="left", padx=6)
+        self.thresh_var = tk.StringVar()
+        ttk.Label(btns, textvariable=self.thresh_var, foreground="gray").pack(side="left", padx=8)
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(btns, textvariable=self.status_var, foreground="#0a5").pack(side="right")
+        self._refresh_threshold_label()
 
         self.progress = ttk.Progressbar(self, mode="indeterminate")
         self.progress.pack(fill="x", padx=10)
@@ -183,6 +276,7 @@ class App(tk.Tk):
         chosen = filedialog.askdirectory(title="Select data folder (contains ct-data\\corr)", initialdir=initial)
         if chosen:
             self.dir_var.set(os.path.normpath(chosen))
+            self._refresh_threshold_label()
 
     def _open_output_folder(self):
         d = self.dir_var.get()
@@ -193,6 +287,63 @@ class App(tk.Tk):
 
     def _selected_steps(self):
         return [key for key, _ in STEPS if self.step_vars[key].get()]
+
+    # ---------------------------------------------------- projection threshold
+    def _threshold_key(self, main_dir):
+        return os.path.normcase(os.path.normpath(main_dir))
+
+    def _threshold_for(self, main_dir):
+        saved = self.cfg.get("thresholds", {})
+        return float(saved.get(self._threshold_key(main_dir), DEFAULT_THRESHOLD))
+
+    def _set_threshold_for(self, main_dir, value):
+        self.cfg.setdefault("thresholds", {})[self._threshold_key(main_dir)] = float(value)
+        save_config(self.cfg)
+
+    def _refresh_threshold_label(self):
+        main_dir = self.dir_var.get().strip()
+        if not main_dir:
+            self.thresh_var.set(f"threshold: {DEFAULT_THRESHOLD:g} (default)")
+            return
+        t = self._threshold_for(main_dir)
+        custom = self._threshold_key(main_dir) in self.cfg.get("thresholds", {})
+        self.thresh_var.set(f"threshold: {t:g}" + ("" if custom else " (default)"))
+
+    def _find_projection_tif(self, corr_dir):
+        preferred = os.path.join(corr_dir, "proj_000_0_000{:05d}.tif".format(5000))
+        if os.path.isfile(preferred):
+            return preferred
+        cands = sorted(f for f in os.listdir(corr_dir)
+                       if f.startswith("proj_000_0_000") and f.endswith(".tif"))
+        if not cands:
+            return None
+        return os.path.join(corr_dir, cands[len(cands) // 2])
+
+    def _check_threshold(self):
+        main_dir = self.dir_var.get().strip()
+        if not main_dir or not os.path.isdir(main_dir):
+            messagebox.showerror("FMIG Rat Reconstruction", "Please choose a valid data folder first.")
+            return
+        if not HAVE_PIL:
+            messagebox.showerror("FMIG Rat Reconstruction",
+                                 "Pillow (PIL) is needed to preview the projection but is not "
+                                 "installed in this Python environment.")
+            return
+        corr_dir = os.path.join(main_dir, "ct-data", "corr")
+        if not os.path.isdir(corr_dir):
+            messagebox.showerror("FMIG Rat Reconstruction",
+                                 f"No projections folder found:\n{corr_dir}")
+            return
+        tiff_path = self._find_projection_tif(corr_dir)
+        if not tiff_path:
+            messagebox.showerror("FMIG Rat Reconstruction",
+                                 f"No projection .tif files found in:\n{corr_dir}")
+            return
+        dlg = ThresholdDialog(self, tiff_path, current=self._threshold_for(main_dir))
+        if dlg.result is not None:
+            self._set_threshold_for(main_dir, dlg.result)
+            self._refresh_threshold_label()
+            self._log(f"[threshold] set to {dlg.result:g} for this folder\n")
 
     # ------------------------------------------------------- recon server ---
     def _poll_server_status(self):
@@ -278,6 +429,8 @@ class App(tk.Tk):
                 "Edit MI_ENV_PYTHON at the top of fmig_rat_app.py if it has moved.")
             return
 
+        threshold = self._threshold_for(main_dir)
+
         self.cfg["last_dir"] = main_dir
         self.cfg["browse_root"] = os.path.dirname(main_dir)
         self.cfg["steps"] = steps
@@ -291,7 +444,8 @@ class App(tk.Tk):
         self._clear_preview()
         self.last_artifacts = {}
 
-        cmd = [MI_ENV_PYTHON, "-u", DRIVER, main_dir, "--steps", ",".join(steps)]
+        cmd = [MI_ENV_PYTHON, "-u", DRIVER, main_dir,
+               "--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
         self._log(f"$ {' '.join(cmd)}\n")
         try:
             self.proc = subprocess.Popen(
