@@ -71,27 +71,40 @@ def _lung_mask_shape(im, threshold, zooms, printtolog=False, fill_holes=True):
     trans_ax = [a for a in range(3) if a != scan_ax]      # the two in-plane axes
     finite = np.isfinite(im)
 
-    def strip_exterior(air_bool):
+    def interior_labels(air_bool):
+        """Label the air, then zero every component that reaches >= 3 frame
+        faces (exterior air / cylindrical-FOV rind). Survivor labels are left
+        as-is - numbering is gappy but bincount / find_objects handle that -
+        so this costs one label pass, not two."""
         lab, n = ndimage.label(air_bool)
         if n == 0:
-            return lab, 0
+            return lab, []
+        drop = np.zeros(n + 1, bool)
+        survivors = []
         for i, sl in enumerate(ndimage.find_objects(lab), start=1):
             if sl is None:
                 continue
             faces = sum(int(s.start == 0) + int(s.stop == d) for s, d in zip(sl, shape))
             if faces >= 3:
-                lab[lab == i] = 0
-        return ndimage.label(lab > 0)
+                drop[i] = True
+            else:
+                survivors.append(i)
+        if drop.any():
+            lab[drop[lab]] = 0                    # one O(n) pass via lookup table
+        return lab, survivors
 
     def pick(air_bool, min_ml, max_ml, min_ext_mm, min_bbox_fill, max_ext_frac, clo, chi):
-        lab, n = strip_exterior(air_bool)
-        if n == 0:
+        lab, survivors = interior_labels(air_bool)
+        if not survivors:
             return None, [], []
-        sizes = np.bincount(lab.ravel()); sizes[0] = 0
+        sizes = np.bincount(lab.ravel())
+        objs = ndimage.find_objects(lab)
+        # a lung is always one of the largest air components once the exterior
+        # is gone; only score the biggest handful (bounds work + the log).
+        survivors.sort(key=lambda i: sizes[i], reverse=True)
         kept, rej = [], []
-        for i, sl in enumerate(ndimage.find_objects(lab), start=1):
-            if sl is None:
-                continue
+        for i in survivors[:12]:
+            sl = objs[i - 1]
             cnt = int(sizes[i])
             vol_ml = cnt * voxvol_ml
             ext_mm = np.array([(s.stop - s.start) * z for s, z in zip(sl, zooms)])
@@ -112,10 +125,8 @@ def _lung_mask_shape(im, threshold, zooms, printtolog=False, fill_holes=True):
             (kept if ok else rej).append(rec)
         if not kept:
             return None, kept, rej
-        out = np.zeros(im.shape, bool)
-        for rec in kept:
-            out |= lab == rec[0]
-        return out, kept, rej
+        keep_ids = np.array([rec[0] for rec in kept])
+        return np.isin(lab, keep_ids), kept, rej
 
     # HU ladder: a fully inflated lung is mostly air (< -200 HU) but a lung at
     # end-expiration sits far denser (-400..-700 HU central), so -200 finds only
@@ -136,10 +147,10 @@ def _lung_mask_shape(im, threshold, zooms, printtolog=False, fill_holes=True):
                 stage = f"shape-relaxed@{thr}"
                 break
     if lung is None:  # 3) largest interior blob at the most permissive threshold
-        lab, n = strip_exterior(finite & (im < ladder[-1]))
-        if n:
-            s = np.bincount(lab.ravel()); s[0] = 0
-            lung = lab == int(np.argmax(s))
+        lab, survivors = interior_labels(finite & (im < ladder[-1]))
+        if survivors:
+            sizes = np.bincount(lab.ravel())
+            lung = lab == max(survivors, key=lambda i: sizes[i])
             stage = f"largest-interior-air@{ladder[-1]}"
     if lung is None:  # 4) last resort: largest air not owning the [0,0,0] corner
         lab, n = ndimage.label(finite & (im < threshold))
@@ -151,9 +162,17 @@ def _lung_mask_shape(im, threshold, zooms, printtolog=False, fill_holes=True):
             lung = np.zeros(im.shape, bool)
         stage = "largest-air-fallback"
 
-    lung = ndimage.binary_closing(lung)
-    if fill_holes:
-        lung = ndimage.binary_fill_holes(lung)
+    # closing + hole-fill only inside the lung's bounding box (+2 vox), so these
+    # stay cheap on a 1e9-voxel 60 um volume instead of scanning the whole thing.
+    if lung.any():
+        loc = ndimage.find_objects(lung.view(np.uint8))[0]
+        box = tuple(slice(max(0, s.start - 2), min(int(d), s.stop + 2))
+                    for s, d in zip(loc, shape))
+        sub = ndimage.binary_closing(lung[box])
+        if fill_holes:
+            sub = ndimage.binary_fill_holes(sub)
+        lung[box] = sub
+
     if printtolog:
         rshort = rej if len(rej) <= 8 else rej[:8] + [f"...+{len(rej) - 8} more"]
         print(f"  lung selection [{stage}]  kept={kept}  rejected={rshort}")
