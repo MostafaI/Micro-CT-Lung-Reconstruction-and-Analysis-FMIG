@@ -17,6 +17,149 @@ import pandas as pd
 # import SimpleITK as sitk
 
 
+def _lung_mask_largest(im, threshold, lung_at_boundaries, printtolog):
+    """Original behaviour: after zeroing the component that owns the [0,0,0]
+    corner, take the largest remaining air component (optionally skipping any
+    that reach the frame boundary). Kept for algo='largest'."""
+    def touch_boundary(image):
+        x, y, z = np.array(image.shape) - 1
+        faces = [np.sum(image[0, :, :]), np.sum(image[x, :, :]),
+                 np.sum(image[:, 0, :]), np.sum(image[:, y, :]),
+                 np.sum(image[:, :, 0]), np.sum(image[:, :, z])]
+        faces.remove(max(faces))  # allow 1 side to have values
+        faces.remove(max(faces))  # allow 2 sides to have values
+        return np.sum(faces) != 0
+
+    mask = im < threshold
+    labeled_image, _ = ndimage.label(mask)
+    labeled_image[labeled_image == labeled_image[0, 0, 0]] = 0  # drop exterior air
+    label_sizes = np.bincount(labeled_image.ravel())
+    label_sizes[0] = 0
+    count = 0
+    while True:
+        count += 1
+        lung_label = np.argmax(label_sizes)
+        mask = labeled_image == lung_label
+        if lung_at_boundaries or not touch_boundary(mask):
+            break
+        label_sizes[lung_label] = 0
+        if count == 10:  # avoid infinite loop
+            if printtolog:
+                print("Have a problem with this segmentation!")
+                raise Exception("Have a problem with this segmentation!")
+            return None
+    return ndimage.binary_closing(mask).astype(np.uint8)
+
+
+def _lung_mask_shape(im, threshold, zooms, printtolog=False, fill_holes=True):
+    """Select lung air by physical size / shape / position instead of raw size.
+
+    `im` is the already-smoothed volume in HU; `zooms` is the (a0, a1, a2)
+    voxel size in mm, so every gate below is in millimetres / millilitres and
+    the same numbers work at 60 um and at 200 um.
+
+    Strategy: drop air that reaches >= 3 frame faces (the exterior / cylindrical
+    FOV rind and its streak-artifact tendrils), then among what is left keep the
+    component(s) that look like a lung - a few mL, reasonably compact (a real rat
+    lung fills ~1/4 of its bounding box; streak soup fills ~1/15), not spanning
+    the whole frame, roughly centred in the two in-plane axes.
+    """
+    shape = np.array(im.shape)
+    frame_mm = shape * np.asarray(zooms, float)
+    voxvol_ml = float(np.prod(zooms)) / 1000.0            # mm^3 -> mL
+    scan_ax = int(np.argmin(shape))                       # fewest samples = stack axis
+    trans_ax = [a for a in range(3) if a != scan_ax]      # the two in-plane axes
+    finite = np.isfinite(im)
+
+    def strip_exterior(air_bool):
+        lab, n = ndimage.label(air_bool)
+        if n == 0:
+            return lab, 0
+        for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+            if sl is None:
+                continue
+            faces = sum(int(s.start == 0) + int(s.stop == d) for s, d in zip(sl, shape))
+            if faces >= 3:
+                lab[lab == i] = 0
+        return ndimage.label(lab > 0)
+
+    def pick(air_bool, min_ml, max_ml, min_ext_mm, min_bbox_fill, max_ext_frac, clo, chi):
+        lab, n = strip_exterior(air_bool)
+        if n == 0:
+            return None, [], []
+        sizes = np.bincount(lab.ravel()); sizes[0] = 0
+        kept, rej = [], []
+        for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+            if sl is None:
+                continue
+            cnt = int(sizes[i])
+            vol_ml = cnt * voxvol_ml
+            ext_mm = np.array([(s.stop - s.start) * z for s, z in zip(sl, zooms)])
+            ext_frac = ext_mm / frame_mm
+            bbox_vox = float(np.prod([s.stop - s.start for s in sl]))
+            bbox_fill = cnt / max(bbox_vox, 1.0)
+            faces = sum(int(s.start == 0) + int(s.stop == d) for s, d in zip(sl, shape))
+            cen = np.array([(s.start + s.stop) / 2.0 / d for s, d in zip(sl, shape)])
+            tmin = float(min(ext_mm[a] for a in trans_ax))
+            rec = (i, round(float(vol_ml), 2), tuple(round(float(e), 1) for e in ext_mm),
+                   round(float(bbox_fill), 3), faces, tuple(round(float(c), 2) for c in cen))
+            ok = (min_ml <= vol_ml <= max_ml
+                  and tmin >= min_ext_mm
+                  and bbox_fill >= min_bbox_fill
+                  and float(ext_frac.max()) <= max_ext_frac
+                  and faces <= 2
+                  and all(clo <= cen[a] <= chi for a in trans_ax))
+            (kept if ok else rej).append(rec)
+        if not kept:
+            return None, kept, rej
+        out = np.zeros(im.shape, bool)
+        for rec in kept:
+            out |= lab == rec[0]
+        return out, kept, rej
+
+    # HU ladder: a fully inflated lung is mostly air (< -200 HU) but a lung at
+    # end-expiration sits far denser (-400..-700 HU central), so -200 finds only
+    # crumbs. Start at the caller's threshold and raise it only if nothing
+    # lung-shaped turns up, so inflated phases keep the full -200 mask.
+    ladder = [threshold] + [t for t in (-300, -350, -400, -450) if t < threshold]
+    lung = kept = rej = None
+    stage = None
+    for thr in ladder:  # 1) strict gates
+        lung, kept, rej = pick(finite & (im < thr), 1.5, 15.0, 12.0, 0.14, 0.85, 0.18, 0.82)
+        if lung is not None:
+            stage = f"shape@{thr}"
+            break
+    if lung is None:  # 2) relaxed gates, same ladder
+        for thr in ladder:
+            lung, kept, rej = pick(finite & (im < thr), 0.8, 15.0, 9.0, 0.11, 0.90, 0.12, 0.88)
+            if lung is not None:
+                stage = f"shape-relaxed@{thr}"
+                break
+    if lung is None:  # 3) largest interior blob at the most permissive threshold
+        lab, n = strip_exterior(finite & (im < ladder[-1]))
+        if n:
+            s = np.bincount(lab.ravel()); s[0] = 0
+            lung = lab == int(np.argmax(s))
+            stage = f"largest-interior-air@{ladder[-1]}"
+    if lung is None:  # 4) last resort: largest air not owning the [0,0,0] corner
+        lab, n = ndimage.label(finite & (im < threshold))
+        if n:
+            lab[lab == lab[0, 0, 0]] = 0
+            s = np.bincount(lab.ravel()); s[0] = 0
+            lung = lab == int(np.argmax(s))
+        else:
+            lung = np.zeros(im.shape, bool)
+        stage = "largest-air-fallback"
+
+    lung = ndimage.binary_closing(lung)
+    if fill_holes:
+        lung = ndimage.binary_fill_holes(lung)
+    if printtolog:
+        rshort = rej if len(rej) <= 8 else rej[:8] + [f"...+{len(rej) - 8} more"]
+        print(f"  lung selection [{stage}]  kept={kept}  rejected={rshort}")
+    return lung.astype(np.uint8)
+
+
 def extract_ct_mask(
     file,
     threshold=-200,
@@ -25,24 +168,11 @@ def extract_ct_mask(
     lungdir=None,
     save_files=True,
     lung_at_boundaries=False,
-    printtolog=True):
-    def touch_boundary(image):
-        x, y, z = np.array(image.shape) - 1
-        faces = []
-        faces.append(np.sum(image[0, :, :]))
-        faces.append(np.sum(image[x, :, :]))
-        faces.append(np.sum(image[:, 0, :]))
-        faces.append(np.sum(image[:, y, :]))
-        faces.append(np.sum(image[:, :, 0]))
-        faces.append(np.sum(image[:, :, z]))
-        faces.remove(max(faces))  # Allow 1 side to have values
-        faces.remove(max(faces))  # Allow 2 sides to have values
-        if np.sum(faces) == 0:
-            return False
-        else:
-            return True
-
-    if type(file) == str:
+    printtolog=True,
+    algo="shape",
+    zooms=None):
+    name = os.path.basename(file) if isinstance(file, str) else "<array>"
+    if isinstance(file, str):
         mask_name = file.replace(".nii", "_m.nii")
         lung_name = file.split(".")[0] + indentifier + "_lung.nii.gz"
         if maskdir != None:
@@ -51,48 +181,35 @@ def extract_ct_mask(
             lung_name = os.path.join(lungdir, lung_name.split("/")[-1])
         if os.path.isfile(mask_name):
             if printtolog:
-                print("Skipping segmentation for " + file.split("/")[-1])
+                print("Skipping segmentation for " + name)
                 print("segmentation exists!")
                 print(mask_name)
             return 0
 
     if printtolog:
-        print("Segmenting " + file.split("/")[-1])
+        print("Segmenting " + name)
     start = time.time()
 
     if type(file) == str:
         img = nib.load(file)
         im = img.get_fdata()
+        if zooms is None:
+            zooms = tuple(float(z) for z in img.header.get_zooms()[:3])
     else:
         im = file
+        img = None
+    if zooms is None:
+        zooms = (1.0, 1.0, 1.0)  # array input with no header: assume 1 mm isotropic
+
     # Gaussian filter the image
     im = gaussian_filter(im, sigma=3)
-    some_size = im.shape[0] * im.shape[1] * im.shape[2] / 20
-    mask = im < threshold
-    labeled_image, num_labels = ndimage.label(mask)
-    labeled_image[labeled_image == labeled_image[0, 0, 0]] = 0  # Set background to 0
-    label_sizes = np.bincount(labeled_image.ravel())  # count label sizes
-    label_sizes[0] = 0
-    count = 0
-    if printtolog:
-        print("Segmenting file")
-    while True:
-        count += 1
-        lung_label = np.argmax(label_sizes)
-        mask = labeled_image == lung_label
-        if lung_at_boundaries or not touch_boundary(
-            mask
-        ):  # and mask.sum() > some_size:
-            break
-        else:
-            label_sizes[lung_label] = 0  # reset this index to 0
-        if count == 10:  # Avoid infinite loop
-            if printtolog:
-                print("Have a problem with this segmentation!")
-                raise Exception("Have a problem with this segmentation!")
-            return -1
-    # mask = ndimage.binary_fill_holes(mask)
-    mask = ndimage.binary_closing(mask).astype(np.uint8)
+
+    if algo == "largest":
+        mask = _lung_mask_largest(im, threshold, lung_at_boundaries, printtolog)
+    else:
+        mask = _lung_mask_shape(im, threshold, zooms, printtolog=printtolog)
+    if mask is None:
+        return -1
     if printtolog:
         print("Done")
     if save_files == False:
@@ -107,7 +224,7 @@ def extract_ct_mask(
     if printtolog:
         print(
             "Segmentation for "
-            + file.split("/")[-1]
+            + name
             + " finished in "
             + str(int(time.time() - start))
             + " seconds"
