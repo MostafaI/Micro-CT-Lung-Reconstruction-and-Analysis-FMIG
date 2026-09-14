@@ -56,6 +56,7 @@ STEPS = [
     ("segment", "2. Segment  (compress, lung segmentation, cropped GIF)"),
     ("analysis", "3. Analysis  (FRC / TLC maps)"),
     ("register", "4. Register  (phase registration + deformation field)"),
+    ("diaphragm", "5. Diaphragm Motion  (descent estimate + GIF, needs Register)"),
 ]
 
 

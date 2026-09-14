@@ -33,7 +33,7 @@ if PIPELINE_DIR not in sys.path:
     sys.path.insert(0, PIPELINE_DIR)
 os.chdir(PIPELINE_DIR)  # some helper functions use relative/CWD-relative paths
 
-STEP_ORDER = ["recon", "segment", "analysis", "register"]
+STEP_ORDER = ["recon", "segment", "analysis", "register", "diaphragm"]
 
 
 def log_step(name):
@@ -398,6 +398,338 @@ def get_difformation_fields(main_dir, outname,
     log_artifact(html_out)
 
 
+# --------------------------------------------------------------------------
+# Diaphragm motion estimate - copied as-is (headless) from
+# Desktop/Pipeline/estimate_diaphragm_motion.ipynb, so behavior matches the
+# notebook exactly. Requires the "register" step (EE_toEI_only, PHASE=7) to
+# have run first - raises FileNotFoundError with a clear message otherwise.
+# --------------------------------------------------------------------------
+def _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE):
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    Registered_dir = os.path.join(RESULTS_DIR, "Registered")
+    if not os.path.isdir(Registered_dir) or not os.listdir(Registered_dir):
+        raise FileNotFoundError(f"No registration found in {Registered_dir} - run the Register step first.")
+
+    candidate_dirs = sorted(
+        d for d in os.listdir(Registered_dir)
+        if os.path.isdir(os.path.join(Registered_dir, d)) and "_to_" in d
+    )
+    if not candidate_dirs:
+        raise FileNotFoundError(f"No folders matching '*_to_*' found in {Registered_dir} - run the Register step first.")
+    folder_name = candidate_dirs[0]
+    fix_phase = int(folder_name.split('_to_')[-1].split('R')[-1])
+
+    out_dir = os.path.join(Registered_dir, f"R{PHASE}_to_R{fix_phase}")
+    if not os.path.isdir(out_dir):
+        raise FileNotFoundError(f"Expected registration output folder not found: {out_dir} - run the Register step first.")
+
+    warp_candidates = [os.path.join(out_dir, x) for x in os.listdir(out_dir) if "Forward.nii.gz" in x]
+    if not warp_candidates:
+        raise FileNotFoundError(f"No '*Forward.nii.gz' warp file found in {out_dir} - run the Register step first.")
+    warp_path = warp_candidates[0]
+
+    mask_candidates = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR) if f"R{PHASE}_m.nii" in x]
+    if not mask_candidates:
+        raise FileNotFoundError(f"No mask file matching 'R{PHASE}_m.nii*' found in {RESULTS_DIR}")
+    mask_path = mask_candidates[0]
+
+    return warp_path, mask_path, out_dir, fix_phase
+
+
+def _find_diaphragm_lr_split_index(ai, x_size, search_band=(0.3, 0.7)):
+    counts = np.bincount(ai, minlength=x_size)
+    nz = np.where(counts > 0)[0]
+    lo, hi = nz.min(), nz.max()
+    span = hi - lo
+    band_lo = lo + int(search_band[0] * span)
+    band_hi = lo + int(search_band[1] * span)
+    band = counts[band_lo:band_hi + 1]
+    split_idx = band_lo + int(np.argmin(band))
+    if band.min() > 0.5 * band.max():
+        print(f"WARNING: no clear mediastinal gap found (valley count {band.min()} vs "
+              f"band max {band.max()}) - left/right split may be unreliable, verify visually.")
+    return split_idx
+
+
+def _split_diaphragm_left_right(ai, x_size, affine):
+    split_idx = _find_diaphragm_lr_split_index(ai, x_size)
+    axis0_code = nib.aff2axcodes(affine)[0]  # 'R' or 'L': which way +voxel-index-0 points per the header
+    higher_index_is_right = (axis0_code != "R")  # inverted: header-literal mapping was confirmed backwards
+    is_right = (ai > split_idx) if higher_index_is_right else (ai < split_idx)
+    is_left = ~is_right
+    return is_left, is_right, split_idx
+
+
+def _compute_diaphragm_region(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both"):
+    if side not in ("both", "left", "right"):
+        raise ValueError(f"side must be 'both', 'left', or 'right', got {side!r}")
+
+    warp_path, mask_path, out_dir, fix_phase = _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE)
+
+    warp_img = nib.load(warp_path)
+    mask_img = nib.load(mask_path)
+    affine = warp_img.affine
+    warp = np.asarray(warp_img.dataobj).squeeze()
+    mask = np.asarray(mask_img.dataobj) != 0
+    if warp.shape[:3] != mask.shape:
+        raise ValueError("warp field and mask are on different grids")
+
+    ai, aj, ak = np.where(mask)
+    if ai.size == 0:
+        raise ValueError(f"Mask {mask_path} is empty - no lung voxels found.")
+
+    split_idx = None
+    if side != "both":
+        is_left, is_right, split_idx = _split_diaphragm_left_right(ai, mask.shape[0], affine)
+        keep = is_right if side == "right" else is_left
+        ai, aj, ak = ai[keep], aj[keep], ak[keep]
+        if ai.size == 0:
+            raise ValueError(f"No voxels ended up on the '{side}' side of the L/R split "
+                              f"(split_idx={split_idx}) - check the mask / split_idx.")
+
+    vox = np.stack([ai, aj, ak, np.ones_like(ai)], axis=1).astype(float)
+    world = (affine @ vox.T).T[:, :3]
+    z_world = world[:, 2]  # world RAS Z: +Z = superior/up, -Z = inferior/down
+
+    z_min, z_max = z_world.min(), z_world.max()
+    z_thresh = z_min + diaphragm_fraction * (z_max - z_min)
+    in_diaphragm = z_world <= z_thresh
+    if not np.any(in_diaphragm):
+        raise ValueError("No voxels fell inside the diaphragm region - check diaphragm_fraction.")
+
+    dz_region = warp[ai[in_diaphragm], aj[in_diaphragm], ak[in_diaphragm], 2]
+    mean_dz = float(dz_region.mean())
+    descent_mm = -mean_dz  # positive number = moved downward
+
+    return dict(
+        descent_mm=descent_mm,
+        mean_dz=mean_dz,
+        std_dz=float(dz_region.std()),
+        n_voxels=int(in_diaphragm.sum()),
+        PHASE=PHASE, fix_phase=fix_phase, out_dir=out_dir,
+        affine=affine, warp=warp, mask=mask,
+        ai=ai, aj=aj, ak=ak, world=world, z_world=z_world,
+        in_diaphragm=in_diaphragm, z_thresh=z_thresh,
+        diaphragm_fraction=diaphragm_fraction,
+        side=side, split_voxel_index=split_idx,
+    )
+
+
+def get_diaphragm_descent_mm(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both"):
+    data = _compute_diaphragm_region(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side=side)
+    return data["descent_mm"]
+
+
+def get_diaphragm_descent_mm_lr(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
+    return {
+        "left": get_diaphragm_descent_mm(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side="left"),
+        "right": get_diaphragm_descent_mm(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side="right"),
+    }
+
+
+def visualize_diaphragm_descent(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both",
+                                 ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4,
+                                 DENSE_STRIDE=2, html_out=None):
+    data = _compute_diaphragm_region(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side=side)
+    warp, mask, affine = data["warp"], data["mask"], data["affine"]
+    ai, aj, ak = data["ai"], data["aj"], data["ak"]  # already filtered to `side`
+    world, in_diaphragm = data["world"], data["in_diaphragm"]
+
+    if html_out is None:
+        suffix = "" if side == "both" else f"_{side}"
+        html_out = os.path.join(data["out_dir"], f"diaphragm_descent{suffix}.html")
+
+    other_world = None
+    if side != "both":
+        all_ai, all_aj, all_ak = np.where(mask)
+        is_left, is_right, _ = _split_diaphragm_left_right(all_ai, mask.shape[0], affine)
+        other_sel = is_left if side == "right" else is_right
+        oi, oj, ok = all_ai[other_sel], all_aj[other_sel], all_ak[other_sel]
+        if DENSE_STRIDE > 1:
+            keep = (oi % DENSE_STRIDE == 0) & (oj % DENSE_STRIDE == 0) & (ok % DENSE_STRIDE == 0)
+            oi, oj, ok = oi[keep], oj[keep], ok[keep]
+        other_vox = np.stack([oi, oj, ok, np.ones_like(oi)], axis=1).astype(float)
+        other_world = (affine @ other_vox.T).T[:, :3]
+
+    rest = ~in_diaphragm
+    ri, rj, rk = ai[rest], aj[rest], ak[rest]
+    if DENSE_STRIDE > 1:
+        keep = (ri % DENSE_STRIDE == 0) & (rj % DENSE_STRIDE == 0) & (rk % DENSE_STRIDE == 0)
+        ri, rj, rk = ri[keep], rj[keep], rk[keep]
+    rest_vox = np.stack([ri, rj, rk, np.ones_like(ri)], axis=1).astype(float)
+    rest_world = (affine @ rest_vox.T).T[:, :3]
+
+    di_idx = np.where(in_diaphragm)[0]
+    di_i, di_j, di_k = ai[di_idx], aj[di_idx], ak[di_idx]
+    if DENSE_STRIDE > 1:
+        keep = (di_i % DENSE_STRIDE == 0) & (di_j % DENSE_STRIDE == 0) & (di_k % DENSE_STRIDE == 0)
+        di_i, di_j, di_k = di_i[keep], di_j[keep], di_k[keep]
+    diaphragm_vox = np.stack([di_i, di_j, di_k, np.ones_like(di_i)], axis=1).astype(float)
+    diaphragm_world = (affine @ diaphragm_vox.T).T[:, :3]
+
+    bi, bj, bk = ai[in_diaphragm], aj[in_diaphragm], ak[in_diaphragm]
+    block_id = np.stack([bi // ARROW_BLOCK, bj // ARROW_BLOCK, bk // ARROW_BLOCK], axis=1)
+    uniq_blocks, inverse = np.unique(block_id, axis=0, return_inverse=True)
+    vecs_all = warp[bi, bj, bk, :]
+    n_blocks = len(uniq_blocks)
+    vec_sums = np.zeros((n_blocks, 3))
+    idx_sums = np.zeros((n_blocks, 3))
+    counts = np.zeros(n_blocks)
+    np.add.at(vec_sums, inverse, vecs_all)
+    np.add.at(idx_sums, inverse, np.stack([bi, bj, bk], axis=1).astype(float))
+    np.add.at(counts, inverse, 1)
+    keep_blocks = counts >= MIN_VOXELS_PER_ARROW
+    if keep_blocks.sum() == 0:
+        keep_blocks = counts >= 1
+    mean_vecs = vec_sums[keep_blocks] / counts[keep_blocks, None]
+    mean_idx = idx_sums[keep_blocks] / counts[keep_blocks, None]
+    arrow_vox = np.concatenate([mean_idx, np.ones((len(mean_idx), 1))], axis=1)
+    arrow_world = (affine @ arrow_vox.T).T[:, :3]
+
+    ref_origin = diaphragm_world.mean(axis=0)
+    ref_origin[0] += (world[:, 0].max() - world[:, 0].min()) * 0.35
+    ref_length = max((data["z_world"].max() - data["z_world"].min()) * 0.25, 1.0)
+
+    CONE_HOVERTEMPLATE = (
+        "x=%{x:.2f} mm  y=%{y:.2f} mm  z=%{z:.2f} mm<br>"
+        "dx=%{u:.3f} mm  dy=%{v:.3f} mm  dz=%{w:.3f} mm<br>"
+        "norm=%{norm:.3f} mm<extra></extra>"
+    )
+
+    fig = go.Figure()
+    if other_world is not None:
+        fig.add_trace(go.Scatter3d(
+            x=other_world[:, 0], y=other_world[:, 1], z=other_world[:, 2],
+            mode="markers", marker=dict(size=2, color="dimgray", opacity=0.15),
+            name="other lung (not selected)"))
+    fig.add_trace(go.Scatter3d(
+        x=rest_world[:, 0], y=rest_world[:, 1], z=rest_world[:, 2],
+        mode="markers",
+        marker=dict(size=2, color=("steelblue" if side != "both" else "gray"), opacity=0.3),
+        name=("rest of selected lung" if side != "both" else "rest of lung")))
+    fig.add_trace(go.Scatter3d(
+        x=diaphragm_world[:, 0], y=diaphragm_world[:, 1], z=diaphragm_world[:, 2],
+        mode="markers", marker=dict(size=2.5, color="orange", opacity=0.55),
+        name=f"diaphragm region (bottom {diaphragm_fraction:.0%})"))
+    fig.add_trace(go.Cone(
+        x=arrow_world[:, 0], y=arrow_world[:, 1], z=arrow_world[:, 2],
+        u=mean_vecs[:, 0], v=mean_vecs[:, 1], w=mean_vecs[:, 2],
+        colorscale="jet", sizemode="scaled", sizeref=4,
+        colorbar=dict(title="mm", x=0.85),
+        hovertemplate=CONE_HOVERTEMPLATE,
+        name="region-averaged displacement"))
+    fig.add_trace(go.Cone(
+        x=[ref_origin[0]], y=[ref_origin[1]], z=[ref_origin[2]],
+        u=[0], v=[0], w=[-ref_length],
+        sizemode="absolute", sizeref=ref_length * 0.5,
+        colorscale=[[0, "black"], [1, "black"]], showscale=False,
+        hovertemplate="reference: DOWN (-Z / inferior)<br>fixed length for visibility, not real data<extra></extra>",
+        name="reference: DOWN (-Z / inferior)"))
+
+    DARK_BG = "black"
+    side_label = {"both": "both lungs", "left": "left lung", "right": "right lung"}[side]
+    fig.update_layout(
+        scene=dict(aspectmode="data",
+                   xaxis=dict(title="X (mm)", backgroundcolor=DARK_BG, color="white", visible=False),
+                   yaxis=dict(title="Y (mm)", backgroundcolor=DARK_BG, color="white", visible=False),
+                   zaxis=dict(title="Z (mm, + = superior/up)", backgroundcolor=DARK_BG, color="white", visible=True),
+                   bgcolor=DARK_BG),
+        paper_bgcolor=DARK_BG,
+        font=dict(color="white"),
+        title=(f"R{PHASE}→R{data['fix_phase']} {side_label} diaphragm descent = {data['descent_mm']:.3f} mm "
+               f"(n={data['n_voxels']:,} voxels, black cone = true DOWN direction)"),
+        width=1100, height=950,
+        legend=dict(font=dict(color="white")),
+    )
+    fig.write_html(html_out)
+    print(f"{side_label} diaphragm descent: {data['descent_mm']:.3f} mm (mean dz={data['mean_dz']:.3f}, "
+          f"std={data['std_dz']:.3f}, n={data['n_voxels']:,} voxels)")
+    print("interactive visualization saved to:", html_out)
+
+    data["figure"] = fig
+    data["html_out"] = html_out
+    return data
+
+
+def _save_diaphragm_rotation_gif(fig, gif_out, n_frames=36, camera_radius=2.0,
+                                  camera_elevation=0.7, frame_duration_ms=100):
+    """Rotating-camera GIF export of the diaphragm plotly figure - same
+    approach as visualize_deformation_field.ipynb's 'Rotating GIF export'
+    cell (requires kaleido for static rendering)."""
+    import io
+    from PIL import Image as PILImage
+    frames = []
+    for i in range(n_frames):
+        theta = 2 * np.pi * i / n_frames
+        fig.update_layout(scene_camera=dict(
+            eye=dict(x=camera_radius * np.cos(theta), y=camera_radius * np.sin(theta), z=camera_elevation)
+        ))
+        png_bytes = fig.to_image(format="png", scale=1)
+        frames.append(PILImage.open(io.BytesIO(png_bytes)).convert("RGB"))
+    frames[0].save(gif_out, save_all=True, append_images=frames[1:], duration=frame_duration_ms, loop=0)
+    return gif_out
+
+
+def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
+    """
+    Estimate diaphragm (lower-lung) downward motion - same computation as
+    estimate_diaphragm_motion.ipynb. Requires the Register step to have been
+    run already; raises FileNotFoundError (surfaced by run() as a clear
+    step failure) if no registration is found.
+
+    Saves into the registration output dir (Results/Registered/R{PHASE}_to_R{fix_phase}):
+      - diaphragm_descent.html / _left.html / _right.html (interactive sanity-check plots)
+      - diaphragm_descent_rotation.gif (rotating-camera GIF of the whole-lung plot)
+      - diaphragm_analysis.txt (the descent numbers)
+    """
+    descent = get_diaphragm_descent_mm(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction)
+    descent_lr = get_diaphragm_descent_mm_lr(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction)
+
+    result = visualize_diaphragm_descent(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction)
+    result_left = visualize_diaphragm_descent(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side="left")
+    result_right = visualize_diaphragm_descent(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side="right")
+
+    out_dir = result["out_dir"]
+    gif_out = os.path.join(out_dir, "diaphragm_descent_rotation.gif")
+    _save_diaphragm_rotation_gif(result["figure"], gif_out)
+    print("rotating GIF saved to:", gif_out)
+    log_artifact(gif_out)
+
+    ratio = (descent_lr["left"] / descent_lr["right"]) if descent_lr["right"] else float("nan")
+
+    lines = [
+        "Diaphragm motion analysis",
+        f"main_dir: {main_dir}",
+        f"outname: {outname}",
+        f"generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"PHASE (moving): {PHASE}",
+        f"fix_phase (fixed): {result['fix_phase']}",
+        f"diaphragm_fraction: {diaphragm_fraction}",
+        "",
+        f"Average diaphragm descent (both lungs): {descent:.3f} mm",
+        f"Left diaphragm descent:                 {descent_lr['left']:.3f} mm",
+        f"Right diaphragm descent:                {descent_lr['right']:.3f} mm",
+        f"Ratio left/right descent:                {ratio:.3f}",
+        "",
+        f"n_voxels (both):  {result['n_voxels']}",
+        f"n_voxels (left):  {result_left['n_voxels']}",
+        f"n_voxels (right): {result_right['n_voxels']}",
+        "",
+        f"HTML (both):  {result['html_out']}",
+        f"HTML (left):  {result_left['html_out']}",
+        f"HTML (right): {result_right['html_out']}",
+        f"GIF: {gif_out}",
+        "",
+    ]
+    txt_out = os.path.join(out_dir, "diaphragm_analysis.txt")
+    with open(txt_out, "w") as f:
+        f.write("\n".join(lines))
+    print("analysis summary saved to:", txt_out)
+    log_artifact(txt_out)
+
+    return dict(descent=descent, descent_lr=descent_lr, out_dir=out_dir, gif_out=gif_out, txt_out=txt_out)
+
+
 outname = 'Optimized_Reconstruction-MI'
 # --------------------------------------------------------------------------
 # End of code copied from the notebook.
@@ -445,6 +777,15 @@ def run(main_dir, steps, threshold=0.5):
             log_failed("register", e)
             return 1
         log_done("register")
+
+    if "diaphragm" in steps:
+        log_step("diaphragm")
+        try:
+            diaphragm_step(main_dir, outname)
+        except Exception as e:
+            log_failed("diaphragm", e)
+            return 1
+        log_done("diaphragm")
 
     print("\n===ALL_DONE===", flush=True)
     return 0
