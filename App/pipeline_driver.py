@@ -683,45 +683,23 @@ PLANE_CONFIG = {
 }
 
 
-def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both",
-                                    plane="coronal", ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4,
-                                    DENSE_STRIDE=2, ARROW_SCALE=1.0, jpg_out=None,
-                                    descent_left=None, descent_right=None):
+def _diaphragm_2d_arrays(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both",
+                          ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4, DENSE_STRIDE=2):
     """
-    Static 2D projection of the same diaphragm-descent picture as
-    visualize_diaphragm_descent(): every point and every displacement arrow
-    is collapsed onto one anatomical plane by dropping the world coordinate
-    perpendicular to it - a 3D-to-2D projection (like a coronal/sagittal/
-    axial X-ray), not a single anatomical slice. Saved as a static
-    dark-background JPG instead of the interactive HTML/GIF.
-
-    plane="coronal" (default: X vs Z, drops Y/anterior-posterior),
-    "sagittal" (Y vs Z, drops X/left-right), or "axial" (X vs Y, drops
-    Z/superior-inferior).
-
-    side="both"/"left"/"right", same meaning as visualize_diaphragm_descent.
-    When side="both" and descent_left/descent_right are both given (diaphragm_step
-    passes its already-computed get_diaphragm_descent_mm_lr() values), the title
-    reports the per-lung descent instead of the both-lungs combined average.
-    Arrows are drawn true to scale (1 mm of real displacement = 1 mm on
-    these axes, same as the lung silhouette) unless ARROW_SCALE is set to
-    something other than its default of 1.0 for a deliberate manual
-    exaggeration/reduction; it does not change the reported descent
-    numbers, only how long the arrows are drawn.
+    Everything the 2D diaphragm visualizations need that does NOT depend on
+    which anatomical plane is being drawn: the warp/mask data, the
+    diaphragm-region and "rest of lung" point clouds (already thinned by
+    DENSE_STRIDE), the block-averaged arrow vectors/positions/magnitudes,
+    and the Left/Right + Anterior/Posterior/Superior/Inferior orientation
+    facts needed for edge labels. Computed once and shared across all three
+    plane renders (coronal/sagittal/axial) instead of redone per plane -
+    used by both visualize_diaphragm_descent_2d (one plane) and
+    visualize_diaphragm_descent_2d_panel (all three, one shared colorbar).
     """
-    if plane not in PLANE_CONFIG:
-        raise ValueError(f"plane must be one of {sorted(PLANE_CONFIG)}, got {plane!r}")
-    cfg = PLANE_CONFIG[plane]
-    h_axis, v_axis = cfg["h"], cfg["v"]
-
     data = _compute_diaphragm_region(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side=side)
     warp, mask, affine = data["warp"], data["mask"], data["affine"]
     ai, aj, ak = data["ai"], data["aj"], data["ak"]  # already filtered to `side`
     in_diaphragm = data["in_diaphragm"]
-
-    if jpg_out is None:
-        side_suffix = "" if side == "both" else f"_{side}"
-        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_{plane}{side_suffix}.jpg")
 
     other_world = None
     if side != "both":
@@ -771,7 +749,52 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     arrow_world = (affine @ arrow_vox.T).T[:, :3]
     arrow_norm = np.linalg.norm(mean_vecs, axis=1)  # full 3D magnitude, used for arrow color
 
-    # --- collapse everything onto this plane: keep only the h/v world axes ---
+    # Which screen edge (higher vs. lower world value) is which anatomical
+    # side - computed from the actual mask geometry rather than assumed.
+    # Left/Right (world axis 0) needs the empirically-corrected split (see
+    # _split_diaphragm_left_right - the affine's own axis code was found
+    # backwards for this axis); so does Anterior/Posterior (axis 1) -
+    # reading it naively off the affine's own code put A and P on the wrong
+    # sides too. Superior/Inferior (axis 2) hasn't shown that problem, so
+    # it alone is read directly from the affine's own RAS axis code.
+    all_ai0, all_aj0, all_ak0 = np.where(mask)
+    is_left_all, is_right_all, _ = _split_diaphragm_left_right(all_ai0, mask.shape[0], affine)
+    all_vox0 = np.stack([all_ai0, all_aj0, all_ak0, np.ones_like(all_ai0)], axis=1).astype(float)
+    all_world_x = (affine @ all_vox0.T).T[:, 0]
+    left_mean_x = all_world_x[is_left_all].mean() if is_left_all.any() else 0.0
+    right_mean_x = all_world_x[is_right_all].mean() if is_right_all.any() else 0.0
+    higher_x_is_left = left_mean_x > right_mean_x
+    axcodes = nib.aff2axcodes(affine)  # e.g. ('R', 'A', 'S') - code for each axis' *positive* direction
+
+    return dict(data=data, other_world=other_world, rest_world=rest_world,
+                diaphragm_world=diaphragm_world, arrow_world=arrow_world,
+                mean_vecs=mean_vecs, arrow_norm=arrow_norm,
+                higher_x_is_left=higher_x_is_left, axcodes=axcodes)
+
+
+def _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_SCALE=1.0,
+                             vmin=0.0, vmax=5.0, show_legend=True):
+    """
+    Draws one plane's projection (coronal/sagittal/axial) of the prepared
+    `arrays` (from _diaphragm_2d_arrays) onto `ax`: the lung/diaphragm point
+    clouds, the true-to-scale block-averaged displacement arrows (colored
+    by magnitude, clamped to [vmin, vmax] so color is directly comparable
+    across planes and across the standalone/panel outputs instead of each
+    auto-scaling to its own data range), edge orientation labels, axis
+    labels, and a top-anchored equal-aspect FOV sized to include every
+    arrow tip. Returns the quiver mappable (for an external colorbar).
+    """
+    cfg = PLANE_CONFIG[plane]
+    h_axis, v_axis = cfg["h"], cfg["v"]
+    other_world = arrays["other_world"]
+    rest_world = arrays["rest_world"]
+    diaphragm_world = arrays["diaphragm_world"]
+    arrow_world = arrays["arrow_world"]
+    mean_vecs = arrays["mean_vecs"]
+    arrow_norm = arrays["arrow_norm"]
+    higher_x_is_left = arrays["higher_x_is_left"]
+    axcodes = arrays["axcodes"]
+
     def _hv(pts):
         return pts[:, h_axis], pts[:, v_axis]
 
@@ -784,30 +807,8 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     # drawn. At 1.0, some arrows may legitimately cross their neighbors
     # when real displacement exceeds the ARROW_BLOCK cell spacing - that's
     # the actual data, not a rendering artifact to hide.
-    scale = ARROW_SCALE
-
-    u = mean_vecs[:, h_axis] * scale
-    v = mean_vecs[:, v_axis] * scale
-
-    # Which screen edge (higher vs. lower world value) is which anatomical
-    # side, for the edge labels below - computed from the actual mask
-    # geometry rather than assumed. Left/Right (world axis 0) needs the
-    # empirically-corrected split (see _split_diaphragm_left_right - the
-    # affine's own axis code was found backwards for this axis); so does
-    # Anterior/Posterior (axis 1) - reading it naively off the affine's own
-    # code put A and P on the wrong sides too, confirmed visually once
-    # sagittal/axial views existed to show it, so that axis is inverted the
-    # same way. Superior/Inferior (axis 2) hasn't shown that problem, so it
-    # alone is read directly from the affine's own RAS axis code.
-    all_ai0, all_aj0, all_ak0 = np.where(mask)
-    is_left_all, is_right_all, _ = _split_diaphragm_left_right(all_ai0, mask.shape[0], affine)
-    all_vox0 = np.stack([all_ai0, all_aj0, all_ak0, np.ones_like(all_ai0)], axis=1).astype(float)
-    all_world_x = (affine @ all_vox0.T).T[:, 0]
-    left_mean_x = all_world_x[is_left_all].mean() if is_left_all.any() else 0.0
-    right_mean_x = all_world_x[is_right_all].mean() if is_right_all.any() else 0.0
-    higher_x_is_left = left_mean_x > right_mean_x
-
-    axcodes = nib.aff2axcodes(affine)  # e.g. ('R', 'A', 'S') - code for each axis' *positive* direction
+    u = mean_vecs[:, h_axis] * ARROW_SCALE
+    v = mean_vecs[:, v_axis] * ARROW_SCALE
 
     def _edge_labels(axis_idx):
         """(label at the low/negative end, label at the high/positive end) of a world axis."""
@@ -821,7 +822,6 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     low_v_label, high_v_label = _edge_labels(v_axis)
 
     DARK_BG = "black"
-    fig, ax = plt.subplots(figsize=(9, 8), facecolor=DARK_BG)
     ax.set_facecolor(DARK_BG)
 
     if other_world is not None:
@@ -839,16 +839,13 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     aax, aaz = _hv(arrow_world)
     q = ax.quiver(aax, aaz, u, v, arrow_norm, cmap="jet", angles="xy", scale_units="xy", scale=1,
                   width=0.007, headwidth=4, headlength=5, headaxislength=4.5, zorder=5)
-    cbar = fig.colorbar(q, ax=ax, fraction=0.04, pad=0.02)
-    cbar.set_label("mm", color="white")
-    cbar.ax.yaxis.set_tick_params(color="white")
-    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="white")
+    q.set_clim(vmin, vmax)  # Quiver doesn't take vmin/vmax as constructor kwargs
 
     # No separate "DOWN" / scale-key reference inset: arrows are drawn true
-    # to scale (see `scale` above), so the mm axes themselves are the only
-    # calibration needed - but which screen edge is which side still needs
-    # to be stated explicitly, since +/- axis values alone don't tell a
-    # reader which is which. Edge labels below answer that directly, in
+    # to scale, so the mm axes themselves are the only length calibration
+    # needed - but which screen edge is which side still needs to be
+    # stated explicitly, since +/- axis values alone don't tell a reader
+    # which is which. Edge labels below answer that directly, in
     # axes-fraction coordinates so they sit at the plot frame regardless of
     # the data's actual mm range.
     label_kw = dict(transform=ax.transAxes, color="white", fontsize=13, fontweight="bold", zorder=10)
@@ -857,25 +854,9 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     ax.text(0.5, 0.985, high_v_label, ha="center", va="top", **label_kw)
     ax.text(0.5, 0.015, low_v_label, ha="center", va="bottom", **label_kw)
 
-    side_label = {"both": "both lungs", "left": "left lung", "right": "right lung"}[side]
     ax.set_xlabel(cfg["h_label"], color="white")
     ax.set_ylabel(cfg["v_label"], color="white")
-    if side == "both" and descent_left is not None and descent_right is not None:
-        descent_line = f"R{PHASE}→R{data['fix_phase']} diaphragm descent - left {descent_left:.3f} mm, right {descent_right:.3f} mm"
-    else:
-        descent_line = f"R{PHASE}→R{data['fix_phase']} {side_label} diaphragm descent = {data['descent_mm']:.3f} mm"
-    scale_note = "arrows to scale" if scale == 1.0 else f"arrows drawn at {scale:.2f}× true length"
-    # fig.suptitle, not ax.set_title: the axial view's rounder silhouette
-    # makes `ax.set_aspect("equal", adjustable="box")` below shrink ax's
-    # own box, and an ax-level title sized to the *original* box width then
-    # overlaps the colorbar (which sits outside ax, at a fixed figure
-    # position). A figure-level title always spans the full figure width,
-    # regardless of how ax gets reshaped.
-    fig.suptitle(
-        f"{descent_line}\n"
-        f"{cfg['desc']}, n={data['n_voxels']:,} voxels - "
-        f"{scale_note}, color = magnitude in mm",
-        color="white", fontsize=10, y=0.98)
+
     # FOV must cover every arrow *tip*, not just the point cloud - a long
     # arrow starting near the bottom/side edge of the lung would otherwise
     # get clipped by the axes limits (matplotlib autoscales to the scatter
@@ -893,26 +874,170 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     # Anchor the (now aspect-shrunk) box to the top instead of the default
     # center: a wide-but-short plane like axial shrinks ax's height to
     # match its data aspect, and a centered box leaves dead space both
-    # above (between the suptitle and ax) and below it - bbox_inches="tight"
+    # above (between the title and ax) and below it - bbox_inches="tight"
     # on savefig only crops outer margins, not that internal gap, so
     # top-anchoring pushes all the slack below ax where cropping removes it.
     ax.set_anchor("N")
     ax.tick_params(colors="white")
     for spine in ax.spines.values():
         spine.set_color("white")
-    # Below the plot, not "upper left": an in-axes legend's width is a fixed
-    # font size, but ax's own box width varies a lot by plane/dataset (a
-    # tall-and-narrow sagittal projection shrinks ax's width far more than
-    # coronal/axial do to keep the 1mm=1mm aspect) - so a legend anchored
-    # inside a narrow ax can extend past the horizontal center and collide
-    # with the S/A top edge label. Anchoring below the axes entirely is
-    # collision-free regardless of how narrow ax ends up.
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.09), fontsize=7,
-              facecolor="black", edgecolor="white", labelcolor="white")
+
+    if show_legend:
+        # Below the plot, not "upper left": an in-axes legend's width is a
+        # fixed font size, but ax's own box width varies a lot by plane/
+        # dataset (a tall-and-narrow sagittal projection shrinks ax's width
+        # far more than coronal/axial do to keep the 1mm=1mm aspect) - so a
+        # legend anchored inside a narrow ax can extend past the horizontal
+        # center and collide with the S/A top edge label. Anchoring below
+        # the axes entirely is collision-free regardless of how narrow ax
+        # ends up.
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.09), fontsize=14,
+                  facecolor="black", edgecolor="white", labelcolor="white")
+
+    return q
+
+
+def _diaphragm_2d_title(data, PHASE, side, descent_left, descent_right, ARROW_SCALE, vmin, vmax, desc):
+    """Shared title-building logic for both the single-plane and panel figures."""
+    side_label = {"both": "both lungs", "left": "left lung", "right": "right lung"}[side]
+    if side == "both" and descent_left is not None and descent_right is not None:
+        descent_line = f"R{PHASE}→R{data['fix_phase']} diaphragm descent - left {descent_left:.3f} mm, right {descent_right:.3f} mm"
+    else:
+        descent_line = f"R{PHASE}→R{data['fix_phase']} {side_label} diaphragm descent = {data['descent_mm']:.3f} mm"
+    scale_note = "arrows to scale" if ARROW_SCALE == 1.0 else f"arrows drawn at {ARROW_SCALE:.2f}× true length"
+    return (f"{descent_line}\n"
+            f"{desc}, n={data['n_voxels']:,} voxels - "
+            f"{scale_note}, color = magnitude {vmin:g}-{vmax:g} mm")
+
+
+def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both",
+                                    plane="coronal", ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4,
+                                    DENSE_STRIDE=2, ARROW_SCALE=1.0, jpg_out=None,
+                                    descent_left=None, descent_right=None,
+                                    vmin=0.0, vmax=5.0):
+    """
+    Static 2D projection of the same diaphragm-descent picture as
+    visualize_diaphragm_descent(): every point and every displacement arrow
+    is collapsed onto one anatomical plane by dropping the world coordinate
+    perpendicular to it - a 3D-to-2D projection (like a coronal/sagittal/
+    axial X-ray), not a single anatomical slice. Saved as a static
+    dark-background JPG instead of the interactive HTML/GIF.
+
+    plane="coronal" (default: X vs Z, drops Y/anterior-posterior),
+    "sagittal" (Y vs Z, drops X/left-right), or "axial" (X vs Y, drops
+    Z/superior-inferior).
+
+    side="both"/"left"/"right", same meaning as visualize_diaphragm_descent.
+    When side="both" and descent_left/descent_right are both given (diaphragm_step
+    passes its already-computed get_diaphragm_descent_mm_lr() values), the title
+    reports the per-lung descent instead of the both-lungs combined average.
+    Arrows are drawn true to scale (1 mm of real displacement = 1 mm on
+    these axes, same as the lung silhouette) unless ARROW_SCALE is set to
+    something other than its default of 1.0 for a deliberate manual
+    exaggeration/reduction; it does not change the reported descent
+    numbers, only how long the arrows are drawn.
+
+    vmin/vmax fix the color scale to a constant mm range (default 0-5mm)
+    instead of auto-scaling to each dataset's own magnitude range, so
+    color is directly comparable across separate runs and across the three
+    plane files - same purpose as visualize_diaphragm_descent_2d_panel's
+    single shared colorbar, just applied per standalone file too.
+    """
+    if plane not in PLANE_CONFIG:
+        raise ValueError(f"plane must be one of {sorted(PLANE_CONFIG)}, got {plane!r}")
+    cfg = PLANE_CONFIG[plane]
+
+    arrays = _diaphragm_2d_arrays(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction,
+                                   side=side, ARROW_BLOCK=ARROW_BLOCK, MIN_VOXELS_PER_ARROW=MIN_VOXELS_PER_ARROW,
+                                   DENSE_STRIDE=DENSE_STRIDE)
+    data = arrays["data"]
+
+    if jpg_out is None:
+        side_suffix = "" if side == "both" else f"_{side}"
+        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_{plane}{side_suffix}.jpg")
+
+    DARK_BG = "black"
+    fig, ax = plt.subplots(figsize=(9, 8), facecolor=DARK_BG)
+    q = _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_SCALE=ARROW_SCALE,
+                                 vmin=vmin, vmax=vmax, show_legend=True)
+
+    cbar = fig.colorbar(q, ax=ax, fraction=0.04, pad=0.02)
+    cbar.set_label("mm", color="white")
+    cbar.ax.yaxis.set_tick_params(color="white")
+    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="white")
+
+    # fig.suptitle, not ax.set_title: the axial view's rounder silhouette
+    # makes `ax.set_aspect("equal", adjustable="box")` shrink ax's own box,
+    # and an ax-level title sized to the *original* box width then overlaps
+    # the colorbar (which sits outside ax, at a fixed figure position). A
+    # figure-level title always spans the full figure width, regardless of
+    # how ax gets reshaped.
+    fig.suptitle(_diaphragm_2d_title(data, PHASE, side, descent_left, descent_right, ARROW_SCALE, vmin, vmax, cfg["desc"]),
+                 color="white", fontsize=17, y=0.98)
 
     plt.savefig(jpg_out, dpi=150, bbox_inches="tight", facecolor=DARK_BG)
     plt.close(fig)
+    side_label = {"both": "both lungs", "left": "left lung", "right": "right lung"}[side]
     print(f"{side_label} 2D {plane} visualization saved to:", jpg_out)
+
+    return jpg_out
+
+
+def visualize_diaphragm_descent_2d_panel(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both",
+                                          ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4, DENSE_STRIDE=2,
+                                          ARROW_SCALE=1.0, jpg_out=None,
+                                          descent_left=None, descent_right=None,
+                                          vmin=0.0, vmax=5.0):
+    """
+    All three projections (coronal, sagittal, axial) side by side in one
+    figure, sharing a single colorbar fixed to [vmin, vmax] mm (same
+    default range as visualize_diaphragm_descent_2d's standalone files) so
+    magnitude is directly comparable across all three panels at a glance,
+    rather than each one auto-scaling to its own data range. The heavy
+    per-voxel computation (_diaphragm_2d_arrays) runs once here and is
+    reused for all three panels instead of being redone three times.
+    """
+    arrays = _diaphragm_2d_arrays(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction,
+                                   side=side, ARROW_BLOCK=ARROW_BLOCK, MIN_VOXELS_PER_ARROW=MIN_VOXELS_PER_ARROW,
+                                   DENSE_STRIDE=DENSE_STRIDE)
+    data = arrays["data"]
+
+    if jpg_out is None:
+        side_suffix = "" if side == "both" else f"_{side}"
+        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_panel{side_suffix}.jpg")
+
+    DARK_BG = "black"
+    fig, axes = plt.subplots(1, 3, figsize=(22, 8), facecolor=DARK_BG)
+    q = None
+    for ax, plane in zip(axes, ("coronal", "sagittal", "axial")):
+        q = _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_SCALE=ARROW_SCALE,
+                                     vmin=vmin, vmax=vmax, show_legend=False)
+        ax.set_title(plane.capitalize(), color="white", fontsize=12)
+
+    # One shared colorbar for all three panels, spanning their combined
+    # height, instead of one per panel.
+    cbar = fig.colorbar(q, ax=axes.tolist(), fraction=0.02, pad=0.015)
+    cbar.set_label("mm", color="white")
+    cbar.ax.yaxis.set_tick_params(color="white")
+    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="white")
+
+    # One shared legend below all three panels, instead of one per panel -
+    # the labels are identical across planes (same underlying point
+    # clouds), so any one panel's handles/labels apply to all three.
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(labels), fontsize=14,
+               facecolor="black", edgecolor="white", labelcolor="white",
+               bbox_to_anchor=(0.5, -0.06))
+
+    fig.suptitle(
+        _diaphragm_2d_title(data, PHASE, side, descent_left, descent_right, ARROW_SCALE, vmin, vmax,
+                             "coronal / sagittal / axial projections"),
+        color="white", fontsize=18, y=1.0)
+
+    plt.savefig(jpg_out, dpi=150, bbox_inches="tight", facecolor=DARK_BG)
+    plt.close(fig)
+    side_label = {"both": "both lungs", "left": "left lung", "right": "right lung"}[side]
+    print(f"{side_label} 2D panel visualization saved to:", jpg_out)
 
     return jpg_out
 
@@ -929,6 +1054,8 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
       - diaphragm_descent_rotation.gif (rotating-camera GIF of the whole-lung plot)
       - diaphragm_2D_visualization_coronal.jpg / _sagittal.jpg / _axial.jpg
         (static coronal/sagittal/axial projections of the same plot)
+      - diaphragm_2D_visualization_panel.jpg (all three side by side, one
+        shared colorbar fixed to the same 0-5mm range as the standalone files)
       - diaphragm_analysis.txt (the descent numbers)
     """
     descent = get_diaphragm_descent_mm(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction)
@@ -951,6 +1078,11 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
             descent_left=descent_lr["left"], descent_right=descent_lr["right"])
         log_artifact(jpg_outs[plane])
     jpg_out = jpg_outs["coronal"]  # kept as the top-level `jpg_out` return key
+
+    panel_out = visualize_diaphragm_descent_2d_panel(
+        main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction,
+        descent_left=descent_lr["left"], descent_right=descent_lr["right"])
+    log_artifact(panel_out)
 
     ratio = (descent_lr["left"] / descent_lr["right"]) if descent_lr["right"] else float("nan")
 
@@ -979,6 +1111,7 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
         f"2D visualization (coronal projection): {jpg_outs['coronal']}",
         f"2D visualization (sagittal projection): {jpg_outs['sagittal']}",
         f"2D visualization (axial projection):    {jpg_outs['axial']}",
+        f"2D visualization (panel, coronal+sagittal+axial): {panel_out}",
         "",
     ]
     txt_out = os.path.join(out_dir, "diaphragm_analysis.txt")
@@ -988,7 +1121,7 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
     log_artifact(txt_out)
 
     return dict(descent=descent, descent_lr=descent_lr, out_dir=out_dir, gif_out=gif_out,
-                jpg_out=jpg_out, jpg_outs=jpg_outs, txt_out=txt_out)
+                jpg_out=jpg_out, jpg_outs=jpg_outs, panel_out=panel_out, txt_out=txt_out)
 
 
 outname = 'Optimized_Reconstruction-MI'
