@@ -9,6 +9,13 @@ plain-text progress markers on stdout so a GUI can follow along.
 Usage:
     python pipeline_driver.py "D:\\Data\\Txk5\\2026-08-06_10h47" [--steps recon,segment,analysis,register]
 
+    Group mode - runs the same steps across every session found under one or
+    more rat directories (see get_rat_session_dirs / run_group), one rat at a
+    time, one session at a time within each rat - same idea as
+    Desktop/Pipeline/Rat_all_dates_analysis.ipynb's per-rat loops. Repeat
+    --rats for multiple rats; mutually exclusive with the positional main_dir:
+        python pipeline_driver.py --rats "D:\\Data\\PhNd7" --rats "D:\\Data\\PhNd9" --steps diaphragm
+
 Must be run with the "mi-env" conda environment's python.exe - the same
 kernel the notebook itself uses (see kernel.json / recon_phase.bat).
 """
@@ -354,10 +361,13 @@ def get_difformation_fields(main_dir, outname,
     arrow_vox = np.concatenate([mean_idx, np.ones((len(mean_idx), 1))], axis=1)
     arrow_world = (affine @ arrow_vox.T).T[:, :3]
 
+    # Uniform stride over the flat voxel list, not a per-axis parity AND -
+    # see the note in _diaphragm_2d_arrays for why the AND scheme can
+    # silently drop an entire spatial region to zero points.
     di, dj, dk = ai, aj, ak
     if DENSE_STRIDE > 1:
-        dkeep = (di % DENSE_STRIDE == 0) & (dj % DENSE_STRIDE == 0) & (dk % DENSE_STRIDE == 0)
-        di, dj, dk = di[dkeep], dj[dkeep], dk[dkeep]
+        stride_n = max(int(DENSE_STRIDE) ** 3, 1)
+        di, dj, dk = di[::stride_n], dj[::stride_n], dk[::stride_n]
     dense_vox = np.stack([di, dj, dk, np.ones_like(di)], axis=1).astype(float)
     dense_world = (affine @ dense_vox.T).T[:, :3]
     print(f"scatter points: {len(di):,}")
@@ -460,7 +470,28 @@ def _split_diaphragm_left_right(ai, x_size, affine):
     return is_left, is_right, split_idx
 
 
+_DIAPHRAGM_REGION_CACHE = {}
+
+
 def _compute_diaphragm_region(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both"):
+    # The warp field alone is typically a multi-GB gzipped NIfTI file -
+    # ~24s to load and decompress on this pipeline's data - and a single
+    # diaphragm_step() run calls this function 10 times across
+    # get_diaphragm_descent_mm/_lr, visualize_diaphragm_descent, and the
+    # three 2D-view/panel functions, 6 of those for side="both" alone, even
+    # though the result only depends on (main_dir, outname, PHASE,
+    # diaphragm_fraction, side) and nothing changes between those calls
+    # within one run. Caching collapses that down to 3 real loads (one per
+    # side actually used). Each caller gets a shallow copy of the cached
+    # dict - the large numpy arrays (warp, mask, ...) aren't copied, only
+    # the dict container - so a caller that stashes extra keys onto its
+    # copy (visualize_diaphragm_descent adds "figure"/"html_out") can't
+    # pollute the shared cache entry or leak into another caller's copy.
+    cache_key = (os.path.normcase(os.path.normpath(main_dir)), outname, PHASE, diaphragm_fraction, side)
+    cached = _DIAPHRAGM_REGION_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
     if side not in ("both", "left", "right"):
         raise ValueError(f"side must be 'both', 'left', or 'right', got {side!r}")
 
@@ -501,7 +532,7 @@ def _compute_diaphragm_region(main_dir, outname, PHASE=7, diaphragm_fraction=0.1
     mean_dz = float(dz_region.mean())
     descent_mm = -mean_dz  # positive number = moved downward
 
-    return dict(
+    result = dict(
         descent_mm=descent_mm,
         mean_dz=mean_dz,
         std_dz=float(dz_region.std()),
@@ -513,6 +544,8 @@ def _compute_diaphragm_region(main_dir, outname, PHASE=7, diaphragm_fraction=0.1
         diaphragm_fraction=diaphragm_fraction,
         side=side, split_voxel_index=split_idx,
     )
+    _DIAPHRAGM_REGION_CACHE[cache_key] = result
+    return dict(result)
 
 
 def get_diaphragm_descent_mm(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, side="both"):
@@ -539,31 +572,33 @@ def visualize_diaphragm_descent(main_dir, outname, PHASE=7, diaphragm_fraction=0
         suffix = "" if side == "both" else f"_{side}"
         html_out = os.path.join(data["out_dir"], f"diaphragm_descent{suffix}.html")
 
+    # Uniform stride over the flat voxel list, not a per-axis parity AND -
+    # see the note in _diaphragm_2d_arrays for why the AND scheme can
+    # silently drop an entire spatial region to zero points.
+    stride_n = max(int(DENSE_STRIDE) ** 3, 1)
+
     other_world = None
     if side != "both":
         all_ai, all_aj, all_ak = np.where(mask)
         is_left, is_right, _ = _split_diaphragm_left_right(all_ai, mask.shape[0], affine)
         other_sel = is_left if side == "right" else is_right
         oi, oj, ok = all_ai[other_sel], all_aj[other_sel], all_ak[other_sel]
-        if DENSE_STRIDE > 1:
-            keep = (oi % DENSE_STRIDE == 0) & (oj % DENSE_STRIDE == 0) & (ok % DENSE_STRIDE == 0)
-            oi, oj, ok = oi[keep], oj[keep], ok[keep]
+        if stride_n > 1:
+            oi, oj, ok = oi[::stride_n], oj[::stride_n], ok[::stride_n]
         other_vox = np.stack([oi, oj, ok, np.ones_like(oi)], axis=1).astype(float)
         other_world = (affine @ other_vox.T).T[:, :3]
 
     rest = ~in_diaphragm
     ri, rj, rk = ai[rest], aj[rest], ak[rest]
-    if DENSE_STRIDE > 1:
-        keep = (ri % DENSE_STRIDE == 0) & (rj % DENSE_STRIDE == 0) & (rk % DENSE_STRIDE == 0)
-        ri, rj, rk = ri[keep], rj[keep], rk[keep]
+    if stride_n > 1:
+        ri, rj, rk = ri[::stride_n], rj[::stride_n], rk[::stride_n]
     rest_vox = np.stack([ri, rj, rk, np.ones_like(ri)], axis=1).astype(float)
     rest_world = (affine @ rest_vox.T).T[:, :3]
 
     di_idx = np.where(in_diaphragm)[0]
     di_i, di_j, di_k = ai[di_idx], aj[di_idx], ak[di_idx]
-    if DENSE_STRIDE > 1:
-        keep = (di_i % DENSE_STRIDE == 0) & (di_j % DENSE_STRIDE == 0) & (di_k % DENSE_STRIDE == 0)
-        di_i, di_j, di_k = di_i[keep], di_j[keep], di_k[keep]
+    if stride_n > 1:
+        di_i, di_j, di_k = di_i[::stride_n], di_j[::stride_n], di_k[::stride_n]
     diaphragm_vox = np.stack([di_i, di_j, di_k, np.ones_like(di_i)], axis=1).astype(float)
     diaphragm_world = (affine @ diaphragm_vox.T).T[:, :3]
 
@@ -651,6 +686,14 @@ def visualize_diaphragm_descent(main_dir, outname, PHASE=7, diaphragm_fraction=0
     return data
 
 
+# Set to True to re-enable the rotating-camera GIF in diaphragm_step().
+# Paused since it's the single slowest part of the step (36 kaleido-rendered
+# frames, ~5 minutes) and unrelated to the redundant-computation fix - every
+# other output (HTML plots, the three 2D views, the panel, the analysis
+# txt) still gets generated normally while this is off.
+GENERATE_DIAPHRAGM_GIF = False
+
+
 def _save_diaphragm_rotation_gif(fig, gif_out, n_frames=36, camera_radius=2.0,
                                   camera_elevation=0.7, frame_duration_ms=100):
     """Rotating-camera GIF export of the diaphragm plotly figure - same
@@ -689,17 +732,36 @@ def _diaphragm_2d_arrays(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, si
     Everything the 2D diaphragm visualizations need that does NOT depend on
     which anatomical plane is being drawn: the warp/mask data, the
     diaphragm-region and "rest of lung" point clouds (already thinned by
-    DENSE_STRIDE), the block-averaged arrow vectors/positions/magnitudes,
-    and the Left/Right + Anterior/Posterior/Superior/Inferior orientation
-    facts needed for edge labels. Computed once and shared across all three
-    plane renders (coronal/sagittal/axial) instead of redone per plane -
-    used by both visualize_diaphragm_descent_2d (one plane) and
-    visualize_diaphragm_descent_2d_panel (all three, one shared colorbar).
+    DENSE_STRIDE), the block-averaged arrow vectors/positions/magnitudes -
+    covering the WHOLE lung, not just the diaphragm region; only the white
+    highlight and the reported descent number are restricted to the bottom
+    `diaphragm_fraction` - and the Left/Right + Anterior/Posterior/Superior/
+    Inferior orientation facts needed for edge labels. Computed once and
+    shared across all three plane renders (coronal/sagittal/axial) instead
+    of redone per plane - used by both visualize_diaphragm_descent_2d (one
+    plane) and visualize_diaphragm_descent_2d_panel (all three, one shared
+    colorbar).
     """
     data = _compute_diaphragm_region(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, side=side)
     warp, mask, affine = data["warp"], data["mask"], data["affine"]
     ai, aj, ak = data["ai"], data["aj"], data["ak"]  # already filtered to `side`
     in_diaphragm = data["in_diaphragm"]
+
+    # Thinning for the background scatter clouds below: NOT a per-axis
+    # "index % DENSE_STRIDE == 0" AND across i/j/k. That scheme requires all
+    # three voxel indices to be simultaneously divisible by DENSE_STRIDE, and
+    # if a whole anatomical region happens to sit on the "wrong" parity in
+    # even one axis (confirmed on real data - a curving lower-lung region
+    # where every voxel had an odd index along one axis), it silently drops
+    # to ZERO points there, regardless of how many thousands of real mask
+    # voxels exist there - not sparser, completely empty, reading as a gap or
+    # a disconnected floating region even though the lung is one solid,
+    # connected shape. A uniform stride over the flat voxel list (every Nth
+    # voxel as returned by np.where, keeping matched i/j/k triples aligned)
+    # can't fail that way: it doesn't depend on any voxel's spatial index
+    # value, so it can't blank out a whole region. N is chosen to keep
+    # roughly the same point density as the old scheme (~1/DENSE_STRIDE^3).
+    stride_n = max(int(DENSE_STRIDE) ** 3, 1)
 
     other_world = None
     if side != "both":
@@ -707,29 +769,33 @@ def _diaphragm_2d_arrays(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, si
         is_left, is_right, _ = _split_diaphragm_left_right(all_ai, mask.shape[0], affine)
         other_sel = is_left if side == "right" else is_right
         oi, oj, ok = all_ai[other_sel], all_aj[other_sel], all_ak[other_sel]
-        if DENSE_STRIDE > 1:
-            keep = (oi % DENSE_STRIDE == 0) & (oj % DENSE_STRIDE == 0) & (ok % DENSE_STRIDE == 0)
-            oi, oj, ok = oi[keep], oj[keep], ok[keep]
+        if stride_n > 1:
+            oi, oj, ok = oi[::stride_n], oj[::stride_n], ok[::stride_n]
         other_vox = np.stack([oi, oj, ok, np.ones_like(oi)], axis=1).astype(float)
         other_world = (affine @ other_vox.T).T[:, :3]
 
     rest = ~in_diaphragm
     ri, rj, rk = ai[rest], aj[rest], ak[rest]
-    if DENSE_STRIDE > 1:
-        keep = (ri % DENSE_STRIDE == 0) & (rj % DENSE_STRIDE == 0) & (rk % DENSE_STRIDE == 0)
-        ri, rj, rk = ri[keep], rj[keep], rk[keep]
+    if stride_n > 1:
+        ri, rj, rk = ri[::stride_n], rj[::stride_n], rk[::stride_n]
     rest_vox = np.stack([ri, rj, rk, np.ones_like(ri)], axis=1).astype(float)
     rest_world = (affine @ rest_vox.T).T[:, :3]
 
     di_idx = np.where(in_diaphragm)[0]
     di_i, di_j, di_k = ai[di_idx], aj[di_idx], ak[di_idx]
-    if DENSE_STRIDE > 1:
-        keep = (di_i % DENSE_STRIDE == 0) & (di_j % DENSE_STRIDE == 0) & (di_k % DENSE_STRIDE == 0)
-        di_i, di_j, di_k = di_i[keep], di_j[keep], di_k[keep]
+    if stride_n > 1:
+        di_i, di_j, di_k = di_i[::stride_n], di_j[::stride_n], di_k[::stride_n]
     diaphragm_vox = np.stack([di_i, di_j, di_k, np.ones_like(di_i)], axis=1).astype(float)
     diaphragm_world = (affine @ diaphragm_vox.T).T[:, :3]
 
-    bi, bj, bk = ai[in_diaphragm], aj[in_diaphragm], ak[in_diaphragm]
+    # Arrows are block-averaged over the WHOLE lung (ai/aj/ak, every voxel
+    # for this `side`), not just the in_diaphragm subset - the diaphragm
+    # region (white highlight above, and the reported descent number) stays
+    # restricted to the bottom `diaphragm_fraction`, but the arrows
+    # themselves show the full deformation field across the entire lung,
+    # same as the whole-lung arrows in the Register step's
+    # deformation_field.html (get_difformation_fields).
+    bi, bj, bk = ai, aj, ak
     block_id = np.stack([bi // ARROW_BLOCK, bj // ARROW_BLOCK, bk // ARROW_BLOCK], axis=1)
     uniq_blocks, inverse = np.unique(block_id, axis=0, return_inverse=True)
     vecs_all = warp[bi, bj, bk, :]
@@ -773,7 +839,7 @@ def _diaphragm_2d_arrays(main_dir, outname, PHASE=7, diaphragm_fraction=0.15, si
 
 
 def _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_SCALE=1.0,
-                             vmin=0.0, vmax=5.0, show_legend=True):
+                             vmin=0.0, vmax=5.0, show_legend=True, show_diaphragm_region=False):
     """
     Draws one plane's projection (coronal/sagittal/axial) of the prepared
     `arrays` (from _diaphragm_2d_arrays) onto `ax`: the lung/diaphragm point
@@ -832,13 +898,22 @@ def _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_S
     ax.scatter(rx, rz, s=4, c=("steelblue" if side != "both" else "gray"), alpha=0.3,
                label=("rest of selected lung" if side != "both" else "rest of lung"))
 
+    # The diaphragm-region voxels (bottom `diaphragm_fraction` of the lung)
+    # need the same baseline gray context dots as the rest of the lung -
+    # arrows cover the whole lung including this region (see
+    # _diaphragm_2d_arrays), so skipping their background dots here left
+    # those arrows with no surrounding mask context at all, reading as if
+    # they floated in a void. Always draw them in the same base color, and
+    # only ADD the white highlight on top when show_diaphragm_region is True.
     dpx, dpz = _hv(diaphragm_world)
-    ax.scatter(dpx, dpz, s=6, c="orange", alpha=0.55,
-               label=f"diaphragm region (bottom {diaphragm_fraction:.0%})")
+    ax.scatter(dpx, dpz, s=4, c=("steelblue" if side != "both" else "gray"), alpha=0.3)
+    if show_diaphragm_region:
+        ax.scatter(dpx, dpz, s=6, c="white", alpha=0.55,
+                   label=f"diaphragm region (bottom {diaphragm_fraction:.0%})")
 
     aax, aaz = _hv(arrow_world)
     q = ax.quiver(aax, aaz, u, v, arrow_norm, cmap="jet", angles="xy", scale_units="xy", scale=1,
-                  width=0.007, headwidth=4, headlength=5, headaxislength=4.5, zorder=5)
+                  width=0.012, headwidth=4.5, headlength=5.5, headaxislength=5, zorder=5)
     q.set_clim(vmin, vmax)  # Quiver doesn't take vmin/vmax as constructor kwargs
 
     # No separate "DOWN" / scale-key reference inset: arrows are drawn true
@@ -914,7 +989,7 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
                                     plane="coronal", ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4,
                                     DENSE_STRIDE=2, ARROW_SCALE=1.0, jpg_out=None,
                                     descent_left=None, descent_right=None,
-                                    vmin=0.0, vmax=5.0):
+                                    vmin=0.0, vmax=5.0, show_diaphragm_region=False):
     """
     Static 2D projection of the same diaphragm-descent picture as
     visualize_diaphragm_descent(): every point and every displacement arrow
@@ -942,6 +1017,12 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
     color is directly comparable across separate runs and across the three
     plane files - same purpose as visualize_diaphragm_descent_2d_panel's
     single shared colorbar, just applied per standalone file too.
+
+    show_diaphragm_region=True adds a white highlight over just the bottom
+    diaphragm_fraction of the lung (where the reported descent number comes
+    from) and appends "_diaphragm" to the default filename - arrows always
+    cover the whole lung either way (see _diaphragm_2d_arrays), this only
+    toggles the highlight.
     """
     if plane not in PLANE_CONFIG:
         raise ValueError(f"plane must be one of {sorted(PLANE_CONFIG)}, got {plane!r}")
@@ -954,12 +1035,13 @@ def visualize_diaphragm_descent_2d(main_dir, outname, PHASE=7, diaphragm_fractio
 
     if jpg_out is None:
         side_suffix = "" if side == "both" else f"_{side}"
-        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_{plane}{side_suffix}.jpg")
+        region_suffix = "_diaphragm" if show_diaphragm_region else ""
+        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_{plane}{side_suffix}{region_suffix}.jpg")
 
     DARK_BG = "black"
     fig, ax = plt.subplots(figsize=(9, 8), facecolor=DARK_BG)
     q = _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_SCALE=ARROW_SCALE,
-                                 vmin=vmin, vmax=vmax, show_legend=True)
+                                 vmin=vmin, vmax=vmax, show_legend=True, show_diaphragm_region=show_diaphragm_region)
 
     cbar = fig.colorbar(q, ax=ax, fraction=0.04, pad=0.02)
     cbar.set_label("mm", color="white")
@@ -987,7 +1069,7 @@ def visualize_diaphragm_descent_2d_panel(main_dir, outname, PHASE=7, diaphragm_f
                                           ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4, DENSE_STRIDE=2,
                                           ARROW_SCALE=1.0, jpg_out=None,
                                           descent_left=None, descent_right=None,
-                                          vmin=0.0, vmax=5.0):
+                                          vmin=0.0, vmax=5.0, show_diaphragm_region=False):
     """
     All three projections (coronal, sagittal, axial) side by side in one
     figure, sharing a single colorbar fixed to [vmin, vmax] mm (same
@@ -996,6 +1078,10 @@ def visualize_diaphragm_descent_2d_panel(main_dir, outname, PHASE=7, diaphragm_f
     rather than each one auto-scaling to its own data range. The heavy
     per-voxel computation (_diaphragm_2d_arrays) runs once here and is
     reused for all three panels instead of being redone three times.
+
+    show_diaphragm_region=True adds a white highlight over just the bottom
+    diaphragm_fraction of the lung in every panel and appends "_diaphragm"
+    to the default filename - see visualize_diaphragm_descent_2d.
     """
     arrays = _diaphragm_2d_arrays(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction,
                                    side=side, ARROW_BLOCK=ARROW_BLOCK, MIN_VOXELS_PER_ARROW=MIN_VOXELS_PER_ARROW,
@@ -1004,15 +1090,27 @@ def visualize_diaphragm_descent_2d_panel(main_dir, outname, PHASE=7, diaphragm_f
 
     if jpg_out is None:
         side_suffix = "" if side == "both" else f"_{side}"
-        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_panel{side_suffix}.jpg")
+        region_suffix = "_diaphragm" if show_diaphragm_region else ""
+        jpg_out = os.path.join(data["out_dir"], f"diaphragm_2D_visualization_panel{side_suffix}{region_suffix}.jpg")
 
     DARK_BG = "black"
     fig, axes = plt.subplots(1, 3, figsize=(22, 8), facecolor=DARK_BG)
     q = None
     for ax, plane in zip(axes, ("coronal", "sagittal", "axial")):
         q = _render_diaphragm_plane(ax, arrays, plane, side, diaphragm_fraction, ARROW_SCALE=ARROW_SCALE,
-                                     vmin=vmin, vmax=vmax, show_legend=False)
+                                     vmin=vmin, vmax=vmax, show_legend=False, show_diaphragm_region=show_diaphragm_region)
         ax.set_title(plane.capitalize(), color="white", fontsize=12)
+        # Override _render_diaphragm_plane's top-*center* anchor with
+        # top-*left*: coronal/sagittal/axial have very different data
+        # aspect ratios, so their equal-aspect boxes shrink to very
+        # different widths, and centering each independently in an
+        # equal-width cell stacks empty space from both sides into one
+        # large gap between panels (most visible between coronal and
+        # sagittal, the widest and narrowest of the three). Left-anchoring
+        # abuts each box to its cell's left edge instead, so any leftover
+        # space collects consistently on the right of each panel rather
+        # than doubling up between panels.
+        ax.set_anchor("NW")
 
     # One shared colorbar for all three panels, spanning their combined
     # height, instead of one per panel.
@@ -1051,11 +1149,17 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
 
     Saves into the registration output dir (Results/Registered/R{PHASE}_to_R{fix_phase}):
       - diaphragm_descent.html / _left.html / _right.html (interactive sanity-check plots)
-      - diaphragm_descent_rotation.gif (rotating-camera GIF of the whole-lung plot)
+      - diaphragm_descent_rotation.gif (rotating-camera GIF of the whole-lung plot;
+        currently skipped - see GENERATE_DIAPHRAGM_GIF)
       - diaphragm_2D_visualization_coronal.jpg / _sagittal.jpg / _axial.jpg
-        (static coronal/sagittal/axial projections of the same plot)
+        (static coronal/sagittal/axial projections of the same plot; arrows
+        cover the whole lung)
       - diaphragm_2D_visualization_panel.jpg (all three side by side, one
         shared colorbar fixed to the same 0-5mm range as the standalone files)
+      - ..._coronal_diaphragm.jpg / _sagittal_diaphragm.jpg / _axial_diaphragm.jpg
+        / _panel_diaphragm.jpg - same four images again, each with a white
+        highlight added over just the bottom diaphragm_fraction (where the
+        reported descent number comes from)
       - diaphragm_analysis.txt (the descent numbers)
     """
     descent = get_diaphragm_descent_mm(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction)
@@ -1067,22 +1171,40 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
 
     out_dir = result["out_dir"]
     gif_out = os.path.join(out_dir, "diaphragm_descent_rotation.gif")
-    _save_diaphragm_rotation_gif(result["figure"], gif_out)
-    print("rotating GIF saved to:", gif_out)
-    log_artifact(gif_out)
+    if GENERATE_DIAPHRAGM_GIF:
+        _save_diaphragm_rotation_gif(result["figure"], gif_out)
+        print("rotating GIF saved to:", gif_out)
+        log_artifact(gif_out)
+    else:
+        print("rotating GIF generation is paused (GENERATE_DIAPHRAGM_GIF=False) - skipping")
 
+    # Each of the 4 image types (3 planes + panel) is saved twice: once
+    # with arrows over the whole lung only (the default), and once with the
+    # bottom-diaphragm_fraction white highlight also turned on - see
+    # show_diaphragm_region on visualize_diaphragm_descent_2d /
+    # _2d_panel. jpg_outs/jpg_outs_diaphragm are keyed the same way so the
+    # txt summary below can list both cleanly.
     jpg_outs = {}
+    jpg_outs_diaphragm = {}
     for plane in ("coronal", "sagittal", "axial"):
         jpg_outs[plane] = visualize_diaphragm_descent_2d(
             main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, plane=plane,
             descent_left=descent_lr["left"], descent_right=descent_lr["right"])
         log_artifact(jpg_outs[plane])
+        jpg_outs_diaphragm[plane] = visualize_diaphragm_descent_2d(
+            main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction, plane=plane,
+            descent_left=descent_lr["left"], descent_right=descent_lr["right"], show_diaphragm_region=True)
+        log_artifact(jpg_outs_diaphragm[plane])
     jpg_out = jpg_outs["coronal"]  # kept as the top-level `jpg_out` return key
 
     panel_out = visualize_diaphragm_descent_2d_panel(
         main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction,
         descent_left=descent_lr["left"], descent_right=descent_lr["right"])
     log_artifact(panel_out)
+    panel_out_diaphragm = visualize_diaphragm_descent_2d_panel(
+        main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction,
+        descent_left=descent_lr["left"], descent_right=descent_lr["right"], show_diaphragm_region=True)
+    log_artifact(panel_out_diaphragm)
 
     ratio = (descent_lr["left"] / descent_lr["right"]) if descent_lr["right"] else float("nan")
 
@@ -1107,11 +1229,15 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
         f"HTML (both):  {result['html_out']}",
         f"HTML (left):  {result_left['html_out']}",
         f"HTML (right): {result_right['html_out']}",
-        f"GIF: {gif_out}",
+        f"GIF: {gif_out if GENERATE_DIAPHRAGM_GIF else '(skipped - GENERATE_DIAPHRAGM_GIF is paused)'}",
         f"2D visualization (coronal projection): {jpg_outs['coronal']}",
         f"2D visualization (sagittal projection): {jpg_outs['sagittal']}",
         f"2D visualization (axial projection):    {jpg_outs['axial']}",
         f"2D visualization (panel, coronal+sagittal+axial): {panel_out}",
+        f"2D visualization + diaphragm-region highlight (coronal): {jpg_outs_diaphragm['coronal']}",
+        f"2D visualization + diaphragm-region highlight (sagittal): {jpg_outs_diaphragm['sagittal']}",
+        f"2D visualization + diaphragm-region highlight (axial):    {jpg_outs_diaphragm['axial']}",
+        f"2D visualization + diaphragm-region highlight (panel):    {panel_out_diaphragm}",
         "",
     ]
     txt_out = os.path.join(out_dir, "diaphragm_analysis.txt")
@@ -1121,7 +1247,8 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
     log_artifact(txt_out)
 
     return dict(descent=descent, descent_lr=descent_lr, out_dir=out_dir, gif_out=gif_out,
-                jpg_out=jpg_out, jpg_outs=jpg_outs, panel_out=panel_out, txt_out=txt_out)
+                jpg_out=jpg_out, jpg_outs=jpg_outs, jpg_outs_diaphragm=jpg_outs_diaphragm,
+                panel_out=panel_out, panel_out_diaphragm=panel_out_diaphragm, txt_out=txt_out)
 
 
 outname = 'Optimized_Reconstruction-MI'
@@ -1130,7 +1257,12 @@ outname = 'Optimized_Reconstruction-MI'
 # --------------------------------------------------------------------------
 
 
-def run(main_dir, steps, threshold=0.5):
+def run(main_dir, steps, threshold=0.5, announce_done=True):
+    """announce_done=False suppresses the trailing "===ALL_DONE===" marker -
+    used by run_group(), which calls this once per session, so the GUI
+    doesn't mistake one session finishing for the whole group being done
+    (run_group prints its own "===GROUP_ALL_DONE===" once every session in
+    the group has actually run)."""
     if "recon" in steps:
         log_step("recon")
         try:
@@ -1181,13 +1313,89 @@ def run(main_dir, steps, threshold=0.5):
             return 1
         log_done("diaphragm")
 
-    print("\n===ALL_DONE===", flush=True)
+    if announce_done:
+        print("\n===ALL_DONE===", flush=True)
     return 0
+
+
+def get_rat_session_dirs(rat_dir):
+    """
+    Every session (date/time) folder under a rat's raw data directory, e.g.
+    D:\\Data\\PhNd7 -> [D:\\Data\\PhNd7\\2026-07-20_11h01, ...], sorted
+    chronologically. Same folder-naming pattern (and same discovery logic)
+    as Desktop/Pipeline/Rat_all_dates_analysis.ipynb's get_dates(): matches
+    "YYYY-MM-DD_HHhMM" directory names directly under the rat folder,
+    regardless of whether reconstruction has been run there yet - unlike
+    get_dates(), this doesn't need to know the outname, since this app
+    always uses the single fixed `outname` above for every session.
+    """
+    import re
+    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}h\d{2}$")
+    if not os.path.isdir(rat_dir):
+        return []
+    return sorted(
+        os.path.join(rat_dir, d) for d in os.listdir(rat_dir)
+        if os.path.isdir(os.path.join(rat_dir, d)) and date_pattern.match(d)
+    )
+
+
+def run_group(rat_dirs, steps, threshold=0.5):
+    """
+    Runs `steps` (the same set run() runs for one dataset) across every
+    session found under each rat directory in `rat_dirs` - one rat at a
+    time, one session at a time within each rat, in the order given. Same
+    "loop over get_dates(rat)" pattern as
+    Rat_all_dates_analysis.ipynb, just driving this script's existing
+    per-session run() instead of the notebook's own inline cells.
+
+    A session whose steps fail is logged (===SESSION_FAILED===) and the
+    group moves on to the next session rather than aborting the whole
+    group - a group run can cover many sessions across many rats, so one
+    bad session shouldn't discard everything already completed. The
+    overall return code is 1 if any session failed, 0 only if every
+    session's every requested step succeeded.
+    """
+    sessions_by_rat = {rat_dir: get_rat_session_dirs(rat_dir) for rat_dir in rat_dirs}
+    total_sessions = sum(len(s) for s in sessions_by_rat.values())
+    print(f"\n===GROUP_START=== rats={len(rat_dirs)} sessions={total_sessions}", flush=True)
+
+    overall_rc = 0
+    done = 0
+    for rat_dir in rat_dirs:
+        rat_name = os.path.basename(os.path.normpath(rat_dir))
+        sessions = sessions_by_rat[rat_dir]
+        if not sessions:
+            print(f"\n===RAT_SKIPPED=== {rat_name}: no session folders found under {rat_dir}", flush=True)
+            continue
+        for session_dir in sessions:
+            done += 1
+            print(f"\n===SESSION=== {session_dir} ({done}/{total_sessions})", flush=True)
+            try:
+                rc = run(session_dir, steps, threshold=threshold, announce_done=False)
+            except Exception as e:
+                print(f"===SESSION_FAILED=== {session_dir}: {e}", flush=True)
+                traceback.print_exc()
+                rc = 1
+            if rc == 0:
+                print(f"===SESSION_DONE=== {session_dir}", flush=True)
+            else:
+                overall_rc = 1
+                print(f"===SESSION_FAILED=== {session_dir}: step(s) failed, see log above", flush=True)
+
+    print(f"\n===GROUP_ALL_DONE=== {done}/{total_sessions} sessions processed", flush=True)
+    return overall_rc
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run the FMIG rat reconstruction pipeline headlessly.")
-    parser.add_argument("main_dir", help=r'Data folder, e.g. D:\Data\Txk5\2026-08-06_10h47')
+    parser.add_argument("main_dir", nargs="?", default=None,
+                         help=r'Data folder for single-dataset mode, e.g. D:\Data\Txk5\2026-08-06_10h47. '
+                              r'Omit and use --rats instead for group mode.')
+    parser.add_argument("--rats", action="append", default=None,
+                         help=r'Rat directory for group mode, e.g. D:\Data\PhNd7 (contains that rat\'s '
+                              r'session subfolders). Repeat --rats once per rat to run several. Every '
+                              r'session found under each rat directory is run in turn (see '
+                              r'get_rat_session_dirs). Mutually exclusive with the positional main_dir.')
     parser.add_argument("--steps", default=",".join(STEP_ORDER),
                          help="Comma-separated subset of: " + ",".join(STEP_ORDER))
     parser.add_argument("--threshold", type=float, default=0.5,
@@ -1195,14 +1403,10 @@ def main():
                               "extracting the breathing signal for gated recon. Default 0.5.")
     args = parser.parse_args()
 
-    main_dir = args.main_dir
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
     unknown = set(steps) - set(STEP_ORDER)
     if unknown:
         print(f"Unknown step(s): {unknown}. Valid steps: {STEP_ORDER}", file=sys.stderr)
-        return 2
-    if not os.path.isdir(main_dir):
-        print(f"main_dir does not exist: {main_dir}", file=sys.stderr)
         return 2
 
     threshold = args.threshold
@@ -1210,6 +1414,27 @@ def main():
         clamped = min(1.0, max(0.01, threshold))
         print(f"threshold {threshold} out of range (0, 1] - using {clamped}", file=sys.stderr)
         threshold = clamped
+
+    if args.rats:
+        if args.main_dir:
+            print("main_dir and --rats are mutually exclusive - pass one or the other.", file=sys.stderr)
+            return 2
+        missing = [r for r in args.rats if not os.path.isdir(r)]
+        if missing:
+            print(f"Rat director{'y' if len(missing) == 1 else 'ies'} not found: {missing}", file=sys.stderr)
+            return 2
+        print(f"rats = {args.rats}")
+        print(f"steps = {steps}")
+        print(f"threshold = {threshold}")
+        return run_group(args.rats, steps, threshold=threshold)
+
+    if not args.main_dir:
+        print("Either main_dir or --rats is required.", file=sys.stderr)
+        return 2
+    main_dir = args.main_dir
+    if not os.path.isdir(main_dir):
+        print(f"main_dir does not exist: {main_dir}", file=sys.stderr)
+        return 2
 
     print(f"main_dir = {main_dir}")
     print(f"steps = {steps}")

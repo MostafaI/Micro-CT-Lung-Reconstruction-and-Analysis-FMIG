@@ -176,6 +176,20 @@ class App(tk.Tk):
         self.last_artifacts = {}
         self._auto_start_attempted = False
 
+        # Group Analysis mode: run the same steps across every session found
+        # under one or more rat directories (see pipeline_driver.get_rat_session_dirs
+        # / run_group) instead of one already-picked dataset - same idea as
+        # Desktop/Pipeline/Rat_all_dates_analysis.ipynb's per-rat loops.
+        self.group_rats = list(self.cfg.get("group_rats", []))
+        self.group_step_vars = {}
+        self.group_step_labels = {}
+        # Which step-label dict _handle_line updates for the run currently in
+        # flight - set in _run() from the mode active at launch time, so
+        # toggling the mode radio buttons (disabled while running anyway)
+        # can't retarget a run already in progress.
+        self._active_step_labels = self.step_labels
+        self._active_steps = []
+
         icon_path = os.path.join(APP_DIR, "lungs.ico")
         if os.path.isfile(icon_path):
             try:
@@ -191,27 +205,27 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
-        top = ttk.Frame(self)
-        top.pack(fill="x", **pad)
-        ttk.Label(top, text="Data folder:", font=("Segoe UI", 10, "bold")).pack(side="left")
-        self.dir_var = tk.StringVar(value=self.cfg.get("last_dir", ""))
-        entry = ttk.Entry(top, textvariable=self.dir_var, state="readonly")
-        entry.pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(top, text="Browse...", command=self._browse).pack(side="left")
+        mode_frame = ttk.Frame(self)
+        mode_frame.pack(fill="x", **pad)
+        ttk.Label(mode_frame, text="Mode:", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.mode_var = tk.StringVar(value=self.cfg.get("mode", "single"))
+        self.single_radio = ttk.Radiobutton(mode_frame, text="Single Dataset", variable=self.mode_var,
+                                             value="single", command=self._on_mode_change)
+        self.single_radio.pack(side="left", padx=(10, 4))
+        self.group_radio = ttk.Radiobutton(mode_frame, text="Group Analysis", variable=self.mode_var,
+                                            value="group", command=self._on_mode_change)
+        self.group_radio.pack(side="left", padx=4)
 
-        steps_frame = ttk.LabelFrame(self, text="Steps to run")
-        steps_frame.pack(fill="x", **pad)
-        self.step_vars = {}
-        saved_steps = set(self.cfg.get("steps", [s[0] for s in STEPS]))
-        for key, label in STEPS:
-            var = tk.BooleanVar(value=key in saved_steps)
-            self.step_vars[key] = var
-            row = ttk.Frame(steps_frame)
-            row.pack(fill="x", padx=6, pady=2, anchor="w")
-            ttk.Checkbutton(row, text=label, variable=var).pack(side="left")
-            status = ttk.Label(row, text="", width=12, foreground="gray")
-            status.pack(side="right")
-            self.step_labels[key] = status
+        # Both mode frames are built up front and swapped in/out of this
+        # container via pack/pack_forget in _on_mode_change, rather than
+        # rebuilt each toggle - keeps widget state (selections, checkboxes)
+        # intact when switching back and forth.
+        self.mode_container = ttk.Frame(self)
+        self.mode_container.pack(fill="x")
+        self.single_frame = ttk.Frame(self.mode_container)
+        self.group_frame = ttk.Frame(self.mode_container)
+        self._build_single_ui(self.single_frame, pad)
+        self._build_group_ui(self.group_frame, pad)
 
         server_frame = ttk.Frame(self)
         server_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -265,9 +279,106 @@ class App(tk.Tk):
         body.add(log_frame, weight=3)
 
         preview_frame = ttk.LabelFrame(body, text="Preview")
-        self.preview_container = ttk.Frame(preview_frame)
-        self.preview_container.pack(fill="both", expand=True, padx=4, pady=4)
+        self.preview_canvas = tk.Canvas(preview_frame, highlightthickness=0)
+        preview_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_canvas.yview)
+        self.preview_canvas.configure(yscrollcommand=preview_scroll.set)
+        self.preview_canvas.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        preview_scroll.pack(side="right", fill="y", pady=4)
+
+        self.preview_container = ttk.Frame(self.preview_canvas)
+        self._preview_window = self.preview_canvas.create_window((0, 0), window=self.preview_container, anchor="nw")
+        self.preview_container.bind(
+            "<Configure>",
+            lambda e: self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
+        self.preview_canvas.bind(
+            "<Configure>",
+            lambda e: self.preview_canvas.itemconfigure(self._preview_window, width=e.width))
+        self.preview_canvas.bind("<MouseWheel>", self._preview_mousewheel)
         body.add(preview_frame, weight=2)
+
+        self._on_mode_change()
+
+    def _build_single_ui(self, parent, pad):
+        top = ttk.Frame(parent)
+        top.pack(fill="x", **pad)
+        ttk.Label(top, text="Data folder:", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.dir_var = tk.StringVar(value=self.cfg.get("last_dir", ""))
+        entry = ttk.Entry(top, textvariable=self.dir_var, state="readonly")
+        entry.pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(top, text="Browse...", command=self._browse).pack(side="left")
+
+        steps_frame = ttk.LabelFrame(parent, text="Steps to run")
+        steps_frame.pack(fill="x", **pad)
+        self.step_vars = {}
+        saved_steps = set(self.cfg.get("steps", [s[0] for s in STEPS]))
+        for key, label in STEPS:
+            var = tk.BooleanVar(value=key in saved_steps)
+            self.step_vars[key] = var
+            row = ttk.Frame(steps_frame)
+            row.pack(fill="x", padx=6, pady=2, anchor="w")
+            ttk.Checkbutton(row, text=label, variable=var).pack(side="left")
+            status = ttk.Label(row, text="", width=12, foreground="gray")
+            status.pack(side="right")
+            self.step_labels[key] = status
+
+    def _build_group_ui(self, parent, pad):
+        # Group Analysis: run the same steps across every session under one
+        # or more rat directories (see pipeline_driver.get_rat_session_dirs /
+        # run_group) - same idea as Rat_all_dates_analysis.ipynb's per-rat
+        # loops, just driven from this GUI's existing subprocess machinery.
+        rats_frame = ttk.LabelFrame(parent, text="Rats to include (every session under each rat runs in turn)")
+        rats_frame.pack(fill="x", **pad)
+
+        list_row = ttk.Frame(rats_frame)
+        list_row.pack(fill="x", padx=6, pady=(4, 2))
+        self.rats_listbox = tk.Listbox(list_row, height=4, selectmode="extended",
+                                        bg="#111", fg="#ddd", highlightthickness=0)
+        self.rats_listbox.pack(side="left", fill="both", expand=True)
+        rats_scroll = ttk.Scrollbar(list_row, orient="vertical", command=self.rats_listbox.yview)
+        self.rats_listbox.configure(yscrollcommand=rats_scroll.set)
+        rats_scroll.pack(side="left", fill="y")
+
+        rats_btns = ttk.Frame(rats_frame)
+        rats_btns.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(rats_btns, text="Add Rat...", command=self._add_rat).pack(side="left")
+        ttk.Button(rats_btns, text="Remove Selected", command=self._remove_selected_rats).pack(side="left", padx=6)
+        self.group_sessions_var = tk.StringVar()
+        ttk.Label(rats_btns, textvariable=self.group_sessions_var, foreground="gray").pack(side="left", padx=8)
+        self._refresh_rats_listbox()
+
+        steps_frame = ttk.LabelFrame(parent, text="Steps to run (same steps, every session)")
+        steps_frame.pack(fill="x", **pad)
+        saved_steps = set(self.cfg.get("group_steps", [s[0] for s in STEPS]))
+        for key, label in STEPS:
+            var = tk.BooleanVar(value=key in saved_steps)
+            self.group_step_vars[key] = var
+            row = ttk.Frame(steps_frame)
+            row.pack(fill="x", padx=6, pady=2, anchor="w")
+            ttk.Checkbutton(row, text=label, variable=var).pack(side="left")
+            status = ttk.Label(row, text="", width=12, foreground="gray")
+            status.pack(side="right")
+            self.group_step_labels[key] = status
+
+        thresh_row = ttk.Frame(parent)
+        thresh_row.pack(fill="x", padx=16, pady=(0, 6))
+        ttk.Label(thresh_row, text="Projection threshold (same value, every session):").pack(side="left")
+        self.group_threshold_var = tk.StringVar(value=f"{self.cfg.get('group_threshold', DEFAULT_THRESHOLD):g}")
+        ttk.Entry(thresh_row, textvariable=self.group_threshold_var, width=6).pack(side="left", padx=6)
+
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        if mode == "single":
+            self.group_frame.pack_forget()
+            self.single_frame.pack(fill="x")
+            self.thresh_btn.config(state="normal")
+            self._refresh_threshold_label()
+        else:
+            self.single_frame.pack_forget()
+            self.group_frame.pack(fill="x")
+            self.thresh_btn.config(state="disabled")
+            self.thresh_var.set("")
+        self.cfg["mode"] = mode
+        save_config(self.cfg)
 
     # -------------------------------------------------------------- actions
     def _browse(self):
@@ -280,14 +391,54 @@ class App(tk.Tk):
             self._refresh_threshold_label()
 
     def _open_output_folder(self):
-        d = self.dir_var.get()
-        if d and os.path.isdir(d):
-            os.startfile(d)
+        if self.mode_var.get() == "single":
+            d = self.dir_var.get()
+            if d and os.path.isdir(d):
+                os.startfile(d)
+            else:
+                messagebox.showinfo("FMIG Rat Reconstruction", "Pick a data folder first.")
         else:
-            messagebox.showinfo("FMIG Rat Reconstruction", "Pick a data folder first.")
+            if self.group_rats:
+                os.startfile(self.group_rats[-1])
+            else:
+                messagebox.showinfo("FMIG Rat Reconstruction", "Add a rat folder first.")
 
-    def _selected_steps(self):
-        return [key for key, _ in STEPS if self.step_vars[key].get()]
+    def _selected_steps(self, step_vars):
+        return [key for key, _ in STEPS if step_vars[key].get()]
+
+    # ---------------------------------------------------------- group mode
+    def _add_rat(self):
+        initial = self.cfg.get("browse_root") or r"D:\Data"
+        if not os.path.isdir(initial):
+            initial = os.path.expanduser("~")
+        chosen = filedialog.askdirectory(title=r"Select a rat's data folder (e.g. D:\Data\PhNd7)",
+                                          initialdir=initial)
+        if not chosen:
+            return
+        chosen = os.path.normpath(chosen)
+        if chosen not in self.group_rats:
+            self.group_rats.append(chosen)
+            self.cfg["group_rats"] = self.group_rats
+            self.cfg["browse_root"] = os.path.dirname(chosen)
+            save_config(self.cfg)
+            self._refresh_rats_listbox()
+
+    def _remove_selected_rats(self):
+        sel = list(self.rats_listbox.curselection())
+        if not sel:
+            return
+        for idx in reversed(sel):
+            del self.group_rats[idx]
+        self.cfg["group_rats"] = self.group_rats
+        save_config(self.cfg)
+        self._refresh_rats_listbox()
+
+    def _refresh_rats_listbox(self):
+        self.rats_listbox.delete(0, "end")
+        for r in self.group_rats:
+            self.rats_listbox.insert("end", r)
+        n = len(self.group_rats)
+        self.group_sessions_var.set(f"{n} rat{'s' if n != 1 else ''} selected")
 
     # ---------------------------------------------------- projection threshold
     def _threshold_key(self, main_dir):
@@ -415,14 +566,6 @@ class App(tk.Tk):
     def _run(self):
         if self.running:
             return
-        main_dir = self.dir_var.get().strip()
-        if not main_dir or not os.path.isdir(main_dir):
-            messagebox.showerror("FMIG Rat Reconstruction", "Please choose a valid data folder first.")
-            return
-        steps = self._selected_steps()
-        if not steps:
-            messagebox.showerror("FMIG Rat Reconstruction", "Select at least one step to run.")
-            return
         if not os.path.isfile(MI_ENV_PYTHON):
             messagebox.showerror(
                 "FMIG Rat Reconstruction",
@@ -430,23 +573,61 @@ class App(tk.Tk):
                 "Edit MI_ENV_PYTHON at the top of fmig_rat_app.py if it has moved.")
             return
 
-        threshold = self._threshold_for(main_dir)
+        mode = self.mode_var.get()
+        if mode == "single":
+            main_dir = self.dir_var.get().strip()
+            if not main_dir or not os.path.isdir(main_dir):
+                messagebox.showerror("FMIG Rat Reconstruction", "Please choose a valid data folder first.")
+                return
+            steps = self._selected_steps(self.step_vars)
+            if not steps:
+                messagebox.showerror("FMIG Rat Reconstruction", "Select at least one step to run.")
+                return
+            threshold = self._threshold_for(main_dir)
 
-        self.cfg["last_dir"] = main_dir
-        self.cfg["browse_root"] = os.path.dirname(main_dir)
-        self.cfg["steps"] = steps
-        save_config(self.cfg)
+            self.cfg["last_dir"] = main_dir
+            self.cfg["browse_root"] = os.path.dirname(main_dir)
+            self.cfg["steps"] = steps
+            save_config(self.cfg)
 
+            active_labels = self.step_labels
+            cmd = [MI_ENV_PYTHON, "-u", DRIVER, main_dir,
+                   "--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
+        else:
+            if not self.group_rats:
+                messagebox.showerror("FMIG Rat Reconstruction", "Add at least one rat folder first.")
+                return
+            steps = self._selected_steps(self.group_step_vars)
+            if not steps:
+                messagebox.showerror("FMIG Rat Reconstruction", "Select at least one step to run.")
+                return
+            try:
+                threshold = float(self.group_threshold_var.get())
+            except ValueError:
+                threshold = DEFAULT_THRESHOLD
+            threshold = min(1.0, max(0.01, threshold))
+
+            self.cfg["group_rats"] = self.group_rats
+            self.cfg["group_steps"] = steps
+            self.cfg["group_threshold"] = threshold
+            save_config(self.cfg)
+
+            active_labels = self.group_step_labels
+            cmd = [MI_ENV_PYTHON, "-u", DRIVER]
+            for rat_dir in self.group_rats:
+                cmd += ["--rats", rat_dir]
+            cmd += ["--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
+
+        self._active_step_labels = active_labels
+        self._active_steps = steps
         for key, _ in STEPS:
-            self.step_labels[key].config(text="", foreground="gray")
+            active_labels[key].config(text="", foreground="gray")
         for key in steps:
-            self.step_labels[key].config(text="queued", foreground="gray")
+            active_labels[key].config(text="queued", foreground="gray")
         self._clear_log()
         self._clear_preview()
         self.last_artifacts = {}
 
-        cmd = [MI_ENV_PYTHON, "-u", DRIVER, main_dir,
-               "--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
         self._log(f"$ {' '.join(cmd)}\n")
         try:
             self.proc = subprocess.Popen(
@@ -465,6 +646,8 @@ class App(tk.Tk):
         self.running = True
         self.run_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.single_radio.config(state="disabled")
+        self.group_radio.config(state="disabled")
         self.status_var.set("Running...")
         self.progress.start(12)
 
@@ -523,22 +706,35 @@ class App(tk.Tk):
 
     def _handle_line(self, line):
         self._log(line + "\n")
+        labels = self._active_step_labels
         if line.startswith("===STEP=== "):
             key = line.split("===STEP=== ", 1)[1].strip()
-            if key in self.step_labels:
-                self.step_labels[key].config(text="running...", foreground="#c80")
+            if key in labels:
+                labels[key].config(text="running...", foreground="#c80")
         elif line.startswith("===STEP_DONE=== "):
             key = line.split("===STEP_DONE=== ", 1)[1].strip()
-            if key in self.step_labels:
-                self.step_labels[key].config(text="done", foreground="#0a5")
+            if key in labels:
+                labels[key].config(text="done", foreground="#0a5")
         elif line.startswith("===STEP_FAILED=== "):
             rest = line.split("===STEP_FAILED=== ", 1)[1]
             key = rest.split(":", 1)[0].strip()
-            if key in self.step_labels:
-                self.step_labels[key].config(text="FAILED", foreground="#c00")
+            if key in labels:
+                labels[key].config(text="FAILED", foreground="#c00")
         elif line.startswith("===ARTIFACT=== "):
             path = line.split("===ARTIFACT=== ", 1)[1].strip()
             self._add_artifact(path)
+        elif line.startswith("===SESSION=== "):
+            # Group mode: a new session is starting - reset this run's step
+            # labels back to "queued" so a status left over from the
+            # previous session ("done"/"FAILED") doesn't linger and read as
+            # if it already applied to the new one.
+            rest = line.split("===SESSION=== ", 1)[1].strip()
+            self.status_var.set(f"Running: {rest}")
+            for key in self._active_steps:
+                if key in labels:
+                    labels[key].config(text="queued", foreground="gray")
+        elif line.startswith("===GROUP_ALL_DONE==="):
+            self.status_var.set("Finished (group).")
         elif line.startswith("===ALL_DONE==="):
             self.status_var.set("Finished.")
 
@@ -546,6 +742,8 @@ class App(tk.Tk):
         self.running = False
         self.run_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.single_radio.config(state="normal")
+        self.group_radio.config(state="normal")
         self.progress.stop()
         if code == 0:
             self.status_var.set("Finished successfully.")
@@ -569,6 +767,18 @@ class App(tk.Tk):
         for w in self.preview_container.winfo_children():
             w.destroy()
         self.thumb_refs.clear()
+
+    def _preview_mousewheel(self, event):
+        # Windows sends <MouseWheel> with event.delta in multiples of 120.
+        self.preview_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_preview_mousewheel(self, widget):
+        # Child labels (thumbnails/links) would otherwise swallow the wheel
+        # event before it reaches the canvas, so bind on every descendant
+        # too, not just the canvas itself.
+        widget.bind("<MouseWheel>", self._preview_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_preview_mousewheel(child)
 
     def _add_artifact(self, path):
         if not os.path.isfile(path):
@@ -596,6 +806,7 @@ class App(tk.Tk):
         link = ttk.Label(row, text=name, foreground="#08c", cursor="hand2")
         link.pack()
         link.bind("<Button-1>", lambda e, p=path: self._open_artifact(p))
+        self._bind_preview_mousewheel(row)
 
     def _open_artifact(self, path):
         try:
