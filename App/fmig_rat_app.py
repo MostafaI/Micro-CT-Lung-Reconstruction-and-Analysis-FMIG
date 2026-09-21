@@ -25,6 +25,37 @@ try:
 except Exception:
     HAVE_PIL = False
 
+# The Left/Right Split editor runs in-process (unlike every other feature
+# here, which shells out to pipeline_driver.py in mi-env) - an interactive
+# drawing tool needs live redraws on every click, and a subprocess round
+# trip per click isn't workable. But `import pipeline_driver` alone takes
+# ~12s (it pulls in the whole recon/ITK/ANTs stack at module level) -
+# confirmed by timing it directly - so that import must NOT happen at this
+# module's own import time, or every launch of this app would pay that
+# 12s cost even for someone who never opens the editor. _load_editor_deps()
+# below does the actual (slow, one-time, cached) import lazily, only when
+# the editor is actually opened.
+_editor_deps = None  # cache: None = not attempted, False = failed, dict = loaded
+
+
+def _load_editor_deps():
+    global _editor_deps
+    if _editor_deps is not None:
+        return _editor_deps
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+        import pipeline_driver as pd
+        _editor_deps = dict(np=np, FigureCanvasTkAgg=FigureCanvasTkAgg, Figure=Figure, pd=pd)
+    except Exception as e:
+        _editor_deps = False
+        print(f"Left/Right Split editor dependencies failed to load: {e}", file=sys.stderr)
+    return _editor_deps
+
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(APP_DIR)  # repo root, holds recon_functions_all.py etc.
 DRIVER = os.path.join(APP_DIR, "pipeline_driver.py")
@@ -54,10 +85,26 @@ if RTKRECON_DIR not in sys.path:
 STEPS = [
     ("recon", "1. Reconstruction  (correct projections, breathing-gated recon)"),
     ("segment", "2. Segment  (compress, lung segmentation, cropped GIF)"),
-    ("analysis", "3. Analysis  (FRC / TLC maps)"),
-    ("register", "4. Register  (phase registration + deformation field)"),
-    ("diaphragm", "5. Diaphragm Motion  (descent estimate + GIF, needs Register)"),
+    ("segment_lr", "3. Segment Left/Right lungs  (fix L/R split, save mLR masks, needs Segment)"),
+    ("analysis", "4. Analysis  (FRC / TLC maps)"),
+    ("register", "5. Register  (phase registration + deformation field)"),
+    ("register_all_phases", "6. Register All Phases to EI  (every phase -> R0, needed for the "
+                             "expansion-time map, slow)"),
+    ("diaphragm", "7. Diaphragm Motion  (descent estimate + GIF, needs Register)"),
+    ("volume_analysis", "8. Volume Analysis  (FRC/TLC/TV per lung, needs Segment)"),
 ]
+
+# Group Analysis only - registering to a rat's own baseline session needs
+# that rat's whole session list up front (to know which session IS the
+# baseline), so it can't be decomposed into independent per-session work
+# the way every step above can; it doesn't make sense for Single Dataset
+# mode's one-session-at-a-time model. See pipeline_driver.run_group /
+# register_baseline_for_rat.
+GROUP_ONLY_STEPS = [
+    ("register_to_baseline", "9. Register to Baseline  (align each later session's R0 onto the rat's "
+                              "first session, needs Segment)"),
+]
+ALL_STEPS = STEPS + GROUP_ONLY_STEPS
 
 
 def load_config():
@@ -159,6 +206,401 @@ class ThresholdDialog(tk.Toplevel):
         self.destroy()
 
 
+class LRSplitEditor(tk.Toplevel):
+    """
+    Interactive left/right lung split + airway exclusion editor. Shows the
+    session's own EI-phase mask (largest lung volume across the 16-phase
+    cycle - same choice save_lr_split_panel already makes). Two editing
+    scopes (the "Scope" radio row), both saved into the same override:
+
+      - "Whole volume" (coarse): draws ONE curve applied to every voxel
+        regardless of slice - a left/right split line on the AXIAL (X/Y)
+        projection, bending along the anterior-posterior axis, and an
+        airway exclusion polygon on the CORONAL (X/Z) projection. This
+        alone can't follow anatomy that changes in a more complex way
+        than a single curve/polygon captures.
+      - "This slice only" (fine): step through individual coronal slices
+        (fixed Y, one at a time) with Prev/Next, and draw a split line
+        and/or airway polygon specific to THAT slice, both in its own
+        X/Z plane. Once any per-slice line exists for a boundary, every
+        voxel uses whichever edited slice is nearest to it along Y (see
+        pipeline_driver.classify_lr_with_override) - so touching up a
+        handful of representative slices refines the untouched slices
+        around them too, instead of requiring every slice to be edited
+        by hand, and it replaces the whole-volume curve for that
+        boundary entirely once used.
+
+    Saved to Results/lr_split_override.json
+    (pipeline_driver.save_lr_split_override); once saved,
+    compute_session_lung_volumes and save_lr_split_panel use it
+    automatically for this session instead of the automatic method. Save
+    also immediately regenerates this session's phase 0/7 _mLR.nii.gz
+    labeled masks (pipeline_driver.segment_lr_step).
+
+    Opened from the "3. Segment Left/Right lungs" step (App._run /
+    App._start_lr_editor_for_run) rather than a standalone button, so it
+    runs in-process alongside the other steps' subprocess run instead of
+    needing its own separate trigger.
+    """
+
+    # Per-axis stride for the interactive preview only - a plain modulo
+    # (not the uniform-stride-over-flat-array fix used elsewhere in
+    # pipeline_driver) is fine here since this never gets summed into a
+    # reported volume, just displayed; the actual Save writes only the
+    # drawn line points, and every volume computed from this session still
+    # reads the full-resolution mask.
+    DOWNSAMPLE_STRIDE = 3
+
+    def __init__(self, parent, main_dir, outname, deps, on_close=None):
+        super().__init__(parent)
+        # deps: the dict from _load_editor_deps() - numpy/matplotlib/
+        # pipeline_driver, loaded lazily by the caller (see
+        # App._start_lr_editor_for_run) since importing pipeline_driver
+        # alone takes ~12s and must not happen at this module's own import
+        # time.
+        self.np = deps["np"]
+        self.pd = deps["pd"]
+        self.Figure = deps["Figure"]
+        self.FigureCanvasTkAgg = deps["FigureCanvasTkAgg"]
+        np = self.np
+
+        # Called with True (saved) or False (cancelled/failed to open) when
+        # this dialog closes - lets the caller (the "3. Segment Left/Right
+        # lungs" step, triggered from Run rather than a standalone button)
+        # update its own step-status label instead of guessing.
+        self.on_close = on_close
+
+        self.main_dir = main_dir
+        self.outname = outname
+        session_name = os.path.basename(os.path.normpath(main_dir))
+        self.title(f"Fix Left/Right Split - {session_name}")
+        self.geometry("1150x700")
+
+        mask_path = os.path.join(main_dir, outname, "Results", "mask.npy")
+        affine_path = os.path.join(main_dir, outname, "Results", "affine.npy")
+        if not os.path.isfile(mask_path) or not os.path.isfile(affine_path):
+            messagebox.showerror(
+                "Fix Left/Right Split",
+                "This session needs the Segment step run first "
+                "(mask.npy/affine.npy not found under Results\\).", parent=parent)
+            self.destroy()
+            if self.on_close:
+                self.on_close(False)
+            return
+
+        masks = np.load(mask_path)
+        self.affine = np.load(affine_path)
+        sizes = masks.sum(axis=(1, 2, 3))
+        self.ei_phase = int(np.argmax(sizes))
+        self.full_mask = masks[self.ei_phase].astype(bool)
+
+        ai, aj, ak = np.where(self.full_mask)
+        keep = (ai % self.DOWNSAMPLE_STRIDE == 0)
+        ai, aj, ak = ai[keep], aj[keep], ak[keep]
+        vox = np.stack([ai, aj, ak, np.ones_like(ai)], axis=1).astype(float)
+        self.world = (self.affine @ vox.T).T[:, :3]
+
+        # Which array axis is the coronal-slicing (anterior-posterior, Y)
+        # axis - see pipeline_driver._axis_for_world_row; this app already
+        # assumes an axis-aligned affine everywhere else (L/R laterality,
+        # the diaphragm region cache, etc).
+        self.y_axis = int(np.argmax(np.abs(self.affine[1, :3])))
+        counts_along_y = self.full_mask.sum(axis=tuple(a for a in range(3) if a != self.y_axis))
+        valid_y = np.where(counts_along_y > 0)[0]
+        self.y_min_idx = int(valid_y.min())
+        self.y_max_idx = int(valid_y.max())
+        self.current_slice_idx = int(np.argmax(counts_along_y))  # widest cross-section, a sensible start
+
+        self.scope_var = tk.StringVar(value="whole")
+        self.mode_var = tk.StringVar(value="split")
+        self.split_points = []
+        self.airway_points = []
+        self.split_slices = {}   # {int Y-index: [[x_mm, z_mm], ...]}
+        self.airway_slices = {}  # {int Y-index: [[x_mm, z_mm], ...]}
+        existing = self.pd.load_lr_split_override(main_dir, outname)
+        if existing:
+            self.split_points = [list(p) for p in existing.get("split_points", [])]
+            self.airway_points = [list(p) for p in existing.get("airway_points", [])]
+            self.split_slices = {int(k): [list(p) for p in v]
+                                  for k, v in (existing.get("split_slices") or {}).items()}
+            self.airway_slices = {int(k): [list(p) for p in v]
+                                   for k, v in (existing.get("airway_slices") or {}).items()}
+
+        self._build_ui()
+        self._redraw()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.transient(parent)
+        self.grab_set()
+
+    def _build_ui(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text=f"Editing R{self.ei_phase} (EI phase, largest lung volume)",
+                  foreground="gray").pack(side="left")
+
+        scope_row = ttk.Frame(self)
+        scope_row.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(scope_row, text="Scope:").pack(side="left")
+        ttk.Radiobutton(scope_row, text="Whole volume (coarse, one curve)", variable=self.scope_var,
+                         value="whole", command=self._on_scope_change).pack(side="left", padx=(6, 12))
+        ttk.Radiobutton(scope_row, text="This slice only (fine, one coronal slice at a time)",
+                         variable=self.scope_var, value="slice", command=self._on_scope_change).pack(side="left")
+
+        # Packed once, always visible, at this fixed position - toggling it
+        # with pack_forget()/pack() later (when the scope radio changes)
+        # would re-add it AFTER already-packed siblings (btns included),
+        # so it'd render below the button row instead of staying put.
+        # Disabling its buttons is scope-aware; its position isn't.
+        slice_nav_row = ttk.Frame(self)
+        slice_nav_row.pack(fill="x", padx=10, pady=(0, 4))
+        self.prev_slice_btn = ttk.Button(slice_nav_row, text="<< Prev slice", command=self._prev_slice)
+        self.prev_slice_btn.pack(side="left")
+        self.next_slice_btn = ttk.Button(slice_nav_row, text="Next slice >>", command=self._next_slice)
+        self.next_slice_btn.pack(side="left", padx=6)
+        self.slice_label_var = tk.StringVar()
+        ttk.Label(slice_nav_row, textvariable=self.slice_label_var, foreground="gray").pack(side="left", padx=10)
+
+        mode_row = ttk.Frame(self)
+        mode_row.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(mode_row, text="Drawing:").pack(side="left")
+        ttk.Radiobutton(mode_row, text="Left/Right split line (white)",
+                         variable=self.mode_var, value="split", command=self._redraw).pack(
+            side="left", padx=(6, 12))
+        ttk.Radiobutton(mode_row, text="Airway exclusion polygon (orange)",
+                         variable=self.mode_var, value="airway", command=self._redraw).pack(side="left")
+        self.mode_hint_var = tk.StringVar()
+        ttk.Label(mode_row, textvariable=self.mode_hint_var, foreground="gray").pack(side="left", padx=10)
+
+        fig_frame = ttk.Frame(self)
+        fig_frame.pack(fill="both", expand=True, padx=10)
+        self.fig = self.Figure(figsize=(10, 5.2), dpi=100, facecolor="black")
+        self.ax_coronal = self.fig.add_subplot(1, 2, 1)
+        self.ax_axial = self.fig.add_subplot(1, 2, 2)
+        self.canvas = self.FigureCanvasTkAgg(self.fig, master=fig_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_click)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Undo Last Point", command=self._undo).pack(side="left")
+        ttk.Button(btns, text="Clear Split Line", command=self._clear_split).pack(side="left", padx=6)
+        ttk.Button(btns, text="Clear Airway Line", command=self._clear_airway).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save", command=self._save).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+
+        self._on_scope_change()
+
+    def _on_scope_change(self):
+        in_slice_scope = self.scope_var.get() == "slice"
+        nav_state = "normal" if in_slice_scope else "disabled"
+        self.prev_slice_btn.config(state=nav_state)
+        self.next_slice_btn.config(state=nav_state)
+        if in_slice_scope:
+            self.mode_hint_var.set("Click the coronal (left) plot for both - split line can bend; "
+                                    "airway needs >= 3 points.")
+        else:
+            self.slice_label_var.set("")
+            self.mode_hint_var.set("Split: click the AXIAL (right) plot. "
+                                    "Airway: click the CORONAL (left) plot, >= 3 points.")
+        self._redraw()
+
+    def _prev_slice(self):
+        if self.current_slice_idx > self.y_min_idx:
+            self.current_slice_idx -= 1
+            self._redraw()
+
+    def _next_slice(self):
+        if self.current_slice_idx < self.y_max_idx:
+            self.current_slice_idx += 1
+            self._redraw()
+
+    def _active_points(self):
+        if self.scope_var.get() == "slice":
+            d = self.split_slices if self.mode_var.get() == "split" else self.airway_slices
+            return d.setdefault(self.current_slice_idx, [])
+        return self.split_points if self.mode_var.get() == "split" else self.airway_points
+
+    def _on_click(self, event):
+        # Whole-volume scope: split points are clicked on the axial (X/Y)
+        # plot, airway points on the coronal (X/Z) plot. Slice scope: both
+        # are clicked on the coronal panel, which now shows just this one
+        # slice's own X/Z plane instead of the whole-volume projection.
+        if self.scope_var.get() == "slice":
+            target_ax = self.ax_coronal
+        else:
+            target_ax = self.ax_axial if self.mode_var.get() == "split" else self.ax_coronal
+        if event.inaxes is not target_ax or event.xdata is None or event.ydata is None:
+            return
+        self._active_points().append([float(event.xdata), float(event.ydata)])
+        self._redraw()
+
+    def _undo(self):
+        pts = self._active_points()
+        if pts:
+            pts.pop()
+            self._redraw()
+
+    def _clear_split(self):
+        if self.scope_var.get() == "slice":
+            self.split_slices.pop(self.current_slice_idx, None)
+        else:
+            self.split_points = []
+        self._redraw()
+
+    def _clear_airway(self):
+        if self.scope_var.get() == "slice":
+            self.airway_slices.pop(self.current_slice_idx, None)
+        else:
+            self.airway_points = []
+        self._redraw()
+
+    def _build_override_dict(self):
+        return dict(
+            split_points=self.split_points,
+            airway_points=self.airway_points,
+            split_slices={str(k): v for k, v in self.split_slices.items()},
+            airway_slices={str(k): v for k, v in self.airway_slices.items()},
+        )
+
+    def _classify_points(self, x, y, z):
+        np = self.np
+        have_split = len(self.split_points) >= 2 or len(self.split_slices) > 0
+        if not have_split:
+            zeros = np.zeros(len(x), dtype=bool)
+            return zeros, zeros, zeros
+        override = self._build_override_dict()
+        return self.pd.classify_lr_with_override(x, y, z, override, self.affine)
+
+    def _slice_world_y(self, idx):
+        return float(self.affine[1, self.y_axis] * idx + self.affine[1, 3])
+
+    def _slice_world_xz(self, idx):
+        np = self.np
+        slicer = [slice(None)] * 3
+        slicer[self.y_axis] = idx
+        plane = self.full_mask[tuple(slicer)]
+        p, q = np.where(plane)
+        other_axes = [a for a in range(3) if a != self.y_axis]
+        vox = np.zeros((len(p), 4))
+        vox[:, other_axes[0]] = p
+        vox[:, other_axes[1]] = q
+        vox[:, self.y_axis] = idx
+        vox[:, 3] = 1
+        world = (self.affine @ vox.T).T[:, :3]
+        return world[:, 0], world[:, 2]
+
+    def _scatter_classified(self, ax, hh, vv, is_left, is_right, is_airway, subtitle):
+        ax.clear()
+        ax.set_facecolor("black")
+        unclassified = ~(is_left | is_right | is_airway)
+        if unclassified.any():
+            ax.scatter(hh[unclassified], vv[unclassified], s=2, c="#666666")
+        if is_left.any():
+            ax.scatter(hh[is_left], vv[is_left], s=2, c="#4090ff")
+        if is_right.any():
+            ax.scatter(hh[is_right], vv[is_right], s=2, c="#ff5040")
+        if is_airway.any():
+            ax.scatter(hh[is_airway], vv[is_airway], s=2, c="yellow")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(subtitle, color="white", fontsize=10)
+        ax.tick_params(colors="white", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("white")
+
+    def _redraw(self):
+        np = self.np
+        x, y, z = self.world[:, 0], self.world[:, 1], self.world[:, 2]
+        is_left, is_right, is_airway = self._classify_points(x, y, z)
+        scope = self.scope_var.get()
+
+        self._scatter_classified(
+            self.ax_axial, x, y, is_left, is_right, is_airway,
+            "Axial (click to add split points)" if scope == "whole" else "Axial (reference)")
+
+        if scope == "slice":
+            xs, zs = self._slice_world_xz(self.current_slice_idx)
+            ys = np.full(len(xs), self._slice_world_y(self.current_slice_idx))
+            sl, sr, sa = self._classify_points(xs, ys, zs)
+            self._scatter_classified(self.ax_coronal, xs, zs, sl, sr, sa,
+                                      f"Coronal slice {self.current_slice_idx} (click to draw)")
+        else:
+            self._scatter_classified(self.ax_coronal, x, z, is_left, is_right, is_airway,
+                                      "Coronal (click to add airway points)")
+
+        if scope == "whole":
+            if self.split_points:
+                pts = np.array(self.split_points)
+                self.ax_axial.plot(pts[:, 0], pts[:, 1], color="white", linewidth=1.5,
+                                     marker="o", markersize=4, zorder=5)
+            if self.airway_points:
+                pts = np.array(self.airway_points)
+                if len(pts) >= 3:
+                    pts = np.vstack([pts, pts[:1]])  # close the polygon
+                self.ax_coronal.plot(pts[:, 0], pts[:, 1], color="orange", linewidth=1.5,
+                                       marker="o", markersize=4, zorder=5)
+        else:
+            for other_idx in set(self.split_slices) | set(self.airway_slices):
+                if other_idx != self.current_slice_idx:
+                    self.ax_axial.axhline(self._slice_world_y(other_idx), color="#888800",
+                                           linewidth=0.5, linestyle=":")
+            self.ax_axial.axhline(self._slice_world_y(self.current_slice_idx), color="cyan",
+                                   linewidth=1, linestyle=":")
+
+            pts = self.split_slices.get(self.current_slice_idx)
+            if pts:
+                pts_arr = np.array(pts)
+                self.ax_coronal.plot(pts_arr[:, 0], pts_arr[:, 1], color="white", linewidth=1.5,
+                                       marker="o", markersize=4, zorder=5)
+            pts2 = self.airway_slices.get(self.current_slice_idx)
+            if pts2:
+                pts2_arr = np.array(pts2)
+                if len(pts2_arr) >= 3:
+                    pts2_arr = np.vstack([pts2_arr, pts2_arr[:1]])
+                self.ax_coronal.plot(pts2_arr[:, 0], pts2_arr[:, 1], color="orange", linewidth=1.5,
+                                       marker="o", markersize=4, zorder=5)
+
+            edited = "yes" if (self.current_slice_idx in self.split_slices
+                                or self.current_slice_idx in self.airway_slices) else "no"
+            self.slice_label_var.set(
+                f"Slice {self.current_slice_idx} (Y-range {self.y_min_idx}-{self.y_max_idx}), "
+                f"edited: {edited}")
+
+        self.canvas.draw_idle()
+
+    def _save(self):
+        if len(self.split_points) < 2 and not self.split_slices:
+            messagebox.showerror(
+                "Fix Left/Right Split",
+                "Draw at least 2 points for the left/right split line first "
+                "(whole-volume scope, or at least one slice in slice scope).",
+                parent=self)
+            return
+        path = self.pd.save_lr_split_override(
+            self.main_dir, self.outname, self.split_points, self.airway_points,
+            split_slices={str(k): v for k, v in self.split_slices.items()},
+            airway_slices={str(k): v for k, v in self.airway_slices.items()})
+        try:
+            mlr_paths = self.pd.segment_lr_step(self.main_dir, self.outname)
+            mlr_msg = f"\n\nSaved {len(mlr_paths)} labeled mask(s): " + ", ".join(
+                os.path.basename(p) for p in mlr_paths) if mlr_paths else ""
+        except Exception as e:
+            mlr_msg = f"\n\n(Could not save the _mLR.nii.gz masks: {e})"
+        messagebox.showinfo(
+            "Fix Left/Right Split",
+            f"Saved:\n{path}\n\nThis session's Volume Analysis step will use this split from now on."
+            f"{mlr_msg}",
+            parent=self)
+        self.destroy()
+        if self.on_close:
+            self.on_close(True)
+
+    def _cancel(self):
+        self.destroy()
+        if self.on_close:
+            self.on_close(False)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -175,6 +617,7 @@ class App(tk.Tk):
         self.thumb_refs = []  # keep PhotoImage refs alive
         self.last_artifacts = {}
         self._auto_start_attempted = False
+        self._pending_lr_editor_dir = None
 
         # Group Analysis mode: run the same steps across every session found
         # under one or more rat directories (see pipeline_driver.get_rat_session_dirs
@@ -348,8 +791,8 @@ class App(tk.Tk):
 
         steps_frame = ttk.LabelFrame(parent, text="Steps to run (same steps, every session)")
         steps_frame.pack(fill="x", **pad)
-        saved_steps = set(self.cfg.get("group_steps", [s[0] for s in STEPS]))
-        for key, label in STEPS:
+        saved_steps = set(self.cfg.get("group_steps", [s[0] for s in ALL_STEPS]))
+        for key, label in ALL_STEPS:
             var = tk.BooleanVar(value=key in saved_steps)
             self.group_step_vars[key] = var
             row = ttk.Frame(steps_frame)
@@ -403,8 +846,53 @@ class App(tk.Tk):
             else:
                 messagebox.showinfo("FMIG Rat Reconstruction", "Add a rat folder first.")
 
+    def _start_lr_editor_for_run(self, main_dir):
+        # Triggered by the "3. Segment Left/Right lungs" step from _run()/
+        # _handle_exit() rather than a standalone button - the editor is
+        # inherently interactive (mouse clicks to draw), so it runs
+        # in-process instead of going through the subprocess pipeline the
+        # other steps use.
+        if "segment_lr" in self.step_labels:
+            self.step_labels["segment_lr"].config(text="editor...", foreground="#c80")
+
+        # First open in this run of the app pays pipeline_driver's own
+        # ~12s import cost (see _load_editor_deps) - show a wait cursor
+        # and status message instead of a silent freeze. Cached after the
+        # first call, so later opens are instant.
+        self.status_var.set("Loading Left/Right Split editor (first time only)...")
+        self.config(cursor="watch")
+        self.update_idletasks()
+        deps = _load_editor_deps()
+        self.config(cursor="")
+        self.status_var.set("Ready.")
+        if not deps:
+            messagebox.showerror(
+                "FMIG Rat Reconstruction",
+                "This feature needs numpy/matplotlib and pipeline_driver importable in the "
+                "Python running this app (it should already be, since this app is normally "
+                "launched with mi-env's own python). See the console for the exact error.")
+            if "segment_lr" in self.step_labels:
+                self.step_labels["segment_lr"].config(text="FAILED", foreground="#c00")
+            return
+
+        LRSplitEditor(self, main_dir, deps["pd"].outname, deps, on_close=self._on_lr_editor_closed)
+
+    def _on_lr_editor_closed(self, saved):
+        if "segment_lr" not in self.step_labels:
+            return
+        if saved:
+            self.step_labels["segment_lr"].config(text="done", foreground="#0a5")
+            self.status_var.set("Finished.")
+        else:
+            self.step_labels["segment_lr"].config(text="cancelled", foreground="gray")
+            self.status_var.set("Ready.")
+
     def _selected_steps(self, step_vars):
-        return [key for key, _ in STEPS if step_vars[key].get()]
+        # ALL_STEPS covers both single-mode's step_vars (only STEPS keys)
+        # and group-mode's group_step_vars (STEPS + GROUP_ONLY_STEPS) -
+        # the "key in step_vars" guard is what makes one function safe for
+        # both, rather than needing a separate version per mode.
+        return [key for key, _ in ALL_STEPS if key in step_vars and step_vars[key].get()]
 
     # ---------------------------------------------------------- group mode
     def _add_rat(self):
@@ -574,6 +1062,7 @@ class App(tk.Tk):
             return
 
         mode = self.mode_var.get()
+        want_lr_editor = False
         if mode == "single":
             main_dir = self.dir_var.get().strip()
             if not main_dir or not os.path.isdir(main_dir):
@@ -590,9 +1079,26 @@ class App(tk.Tk):
             self.cfg["steps"] = steps
             save_config(self.cfg)
 
+            # "Segment Left/Right lungs" is interactive (mouse clicks to
+            # draw) so it can't run inside the headless subprocess the
+            # other steps use - pull it out of the subprocess's step list
+            # and open the editor in-process instead, once any subprocess
+            # steps finish (see _handle_exit) or immediately if it's the
+            # only step selected.
+            want_lr_editor = "segment_lr" in steps
+            subprocess_steps = [s for s in steps if s != "segment_lr"]
+            self._pending_lr_editor_dir = main_dir if want_lr_editor else None
+
+            if not subprocess_steps:
+                if want_lr_editor:
+                    self._pending_lr_editor_dir = None
+                    self._start_lr_editor_for_run(main_dir)
+                return
+
             active_labels = self.step_labels
             cmd = [MI_ENV_PYTHON, "-u", DRIVER, main_dir,
-                   "--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
+                   "--steps", ",".join(subprocess_steps), "--threshold", f"{threshold:g}"]
+            steps = subprocess_steps  # what _launch_process below should actually track
         else:
             if not self.group_rats:
                 messagebox.showerror("FMIG Rat Reconstruction", "Add at least one rat folder first.")
@@ -618,10 +1124,16 @@ class App(tk.Tk):
                 cmd += ["--rats", rat_dir]
             cmd += ["--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
 
+        self._launch_process(cmd, active_labels, steps)
+        if want_lr_editor and "segment_lr" in active_labels:
+            active_labels["segment_lr"].config(text="queued", foreground="gray")
+
+    def _launch_process(self, cmd, active_labels, steps):
         self._active_step_labels = active_labels
         self._active_steps = steps
-        for key, _ in STEPS:
-            active_labels[key].config(text="", foreground="gray")
+        for key, _ in ALL_STEPS:
+            if key in active_labels:
+                active_labels[key].config(text="", foreground="gray")
         for key in steps:
             active_labels[key].config(text="queued", foreground="gray")
         self._clear_log()
@@ -750,6 +1262,14 @@ class App(tk.Tk):
         else:
             self.status_var.set(f"Stopped (exit code {code}).")
         self.proc = None
+
+        pending_dir = self._pending_lr_editor_dir
+        self._pending_lr_editor_dir = None
+        if pending_dir:
+            if code == 0:
+                self._start_lr_editor_for_run(pending_dir)
+            elif "segment_lr" in self.step_labels:
+                self.step_labels["segment_lr"].config(text="skipped", foreground="gray")
 
     # --------------------------------------------------------------- utils
     def _clear_log(self):

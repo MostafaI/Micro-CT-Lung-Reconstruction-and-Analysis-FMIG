@@ -20,10 +20,14 @@ Must be run with the "mi-env" conda environment's python.exe - the same
 kernel the notebook itself uses (see kernel.json / recon_phase.bat).
 """
 import argparse
+import csv
+import json
 import os
+import shutil
 import sys
 import time
 import traceback
+from pathlib import Path
 
 # Headless plotting: the notebook cells below call plt.show()/plt.savefig().
 # This MUST happen before anything else imports matplotlib.pyplot, otherwise
@@ -40,7 +44,8 @@ if PIPELINE_DIR not in sys.path:
     sys.path.insert(0, PIPELINE_DIR)
 os.chdir(PIPELINE_DIR)  # some helper functions use relative/CWD-relative paths
 
-STEP_ORDER = ["recon", "segment", "analysis", "register", "diaphragm"]
+STEP_ORDER = ["recon", "segment", "segment_lr", "analysis", "register", "register_all_phases",
+              "diaphragm", "volume_analysis", "register_to_baseline"]
 
 
 def log_step(name):
@@ -77,6 +82,7 @@ import nibabel as nib
 import numpy as np
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
+from matplotlib.path import Path as MplPath
 
 
 def step_2(main_dir):
@@ -270,15 +276,87 @@ def recon(ROOT_DIR):
     return returncode
 
 
-from register_phases import register_all_phases
+from register_phases import register_all_phases, find_bash, run_registration, DEFAULT_ANTSPATH
 
 
-def register_step(main_dir, outname, EE_toEI_only=False):
+def _pipeline_config_path(main_dir, outname):
+    return os.path.join(main_dir, outname, "Results", "pipeline_config.json")
+
+
+def load_pipeline_config(main_dir, outname):
+    path = _pipeline_config_path(main_dir, outname)
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_pipeline_config(main_dir, outname, cfg):
+    path = _pipeline_config_path(main_dir, outname)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def get_ee_phase(main_dir, outname, force_recompute=False):
+    """
+    The detected end-expiration phase (smallest lung mask volume across the
+    16-phase respiratory cycle) for this dataset - cached in a per-dataset
+    Results/pipeline_config.json so the Register step and every downstream
+    analysis (FRC/TLC/TV/FV/J, diaphragm motion) agree on which phase is
+    "EE", instead of each one separately assuming phase 7. That assumption
+    doesn't always hold: confirmed on real data (PhNd31) that one session's
+    true minimum-volume phase was 11, not 7 - only ~1% smaller in that
+    particular case, but nothing guarantees it always will be, so this
+    detects it per-dataset rather than hardcoding it.
+
+    Requires mask.npy (i.e. the Segment step) to exist the first time this
+    is called for a dataset; after that the result is read from the config
+    file, no mask.npy access needed. Pass force_recompute=True to ignore a
+    cached value and redetect (e.g. after re-running Segment).
+    """
+    cfg = load_pipeline_config(main_dir, outname)
+    if not force_recompute and "ee_phase" in cfg:
+        return cfg["ee_phase"]
+
+    mask_path = os.path.join(main_dir, outname, "Results", "mask.npy")
+    if not os.path.isfile(mask_path):
+        raise FileNotFoundError(
+            f"{mask_path} not found - run the Segment step first so the EE phase can be detected.")
+    masks = np.load(mask_path)
+    sizes = masks.sum(axis=(1, 2, 3))
+    ee_phase = int(np.argmin(sizes))
+    ei_phase = int(np.argmax(sizes))
+
+    cfg["ee_phase"] = ee_phase
+    cfg["ei_phase"] = ei_phase
+    cfg["ee_phase_voxels"] = int(sizes[ee_phase])
+    cfg["ei_phase_voxels"] = int(sizes[ei_phase])
+    cfg["phase_voxel_counts"] = [int(s) for s in sizes]
+    save_pipeline_config(main_dir, outname, cfg)
+    print(f"Detected EE phase R{ee_phase} ({sizes[ee_phase]:,} voxels), "
+          f"EI phase R{ei_phase} ({sizes[ei_phase]:,} voxels) - saved to {_pipeline_config_path(main_dir, outname)}")
+    return ee_phase
+
+
+def register_step(main_dir, outname, EE_toEI_only=False, phase=7):
+    """
+    phase defaults back to 7 (this pipeline's original convention), not the
+    auto-detected EE phase from get_ee_phase() - pass phase=None to use
+    that detection instead. See get_ee_phase's docstring: on at least one
+    real dataset the true minimum-volume phase differed from 7, so this
+    default is a deliberate simplicity/consistency choice, not a claim
+    that phase 7 is always correct.
+    """
     results_dir = os.path.join(main_dir, outname, 'Results')
     registered_dir = os.path.join(results_dir, 'Registered')
     os.makedirs(registered_dir, exist_ok=True)
 
-    only_phases = [7] if EE_toEI_only else None
+    if EE_toEI_only:
+        target_phase = phase if phase is not None else get_ee_phase(main_dir, outname)
+        only_phases = [target_phase]
+    else:
+        only_phases = None
     failures = register_all_phases(results_dir, only_phases=only_phases)
     if failures:
         print(f"Failed phases: {failures}")
@@ -446,6 +524,674 @@ def _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE):
     return warp_path, mask_path, out_dir, fix_phase
 
 
+def _locate_analysis_maps_files(main_dir, outname, PHASE=7):
+    """
+    Find the Jacobian/Warped files from this pipeline's actual R{PHASE}_to_
+    R{fix_phase} ANTs registration (see register_step/register_phases.py),
+    plus R{fix_phase}'s own raw image and mask - everything
+    save_maps_registrations_core's TV/FV/J math needs. Analysis.get_maps()
+    expects a Results/Registration/registered.npy + jacobian.npy pair
+    (one warped/Jacobian volume per phase, all resampled onto a common
+    reference grid) that nothing in this pipeline ever produces, so its
+    TV/FV/J step silently stayed a no-op even with Register done - this
+    pulls the same information from the per-pair NIfTI files this pipeline
+    actually writes instead. yi2.sh always resamples onto the *fixed*
+    phase's own grid (R{fix_phase}, R0 in practice), so R{fix_phase}'s raw
+    image/mask can be used directly with no warp needed - it's the "ei"
+    (larger-volume) side; R{PHASE}'s Warped/Jacobian files are the "ee"
+    (smaller-volume) side. See _locate_diaphragm_warp_and_mask for the
+    matching Forward.nii.gz lookup used by the diaphragm-motion step.
+    """
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    Registered_dir = os.path.join(RESULTS_DIR, "Registered")
+    if not os.path.isdir(Registered_dir) or not os.listdir(Registered_dir):
+        raise FileNotFoundError(f"No registration found in {Registered_dir} - run the Register step first.")
+
+    candidate_dirs = sorted(
+        d for d in os.listdir(Registered_dir)
+        if os.path.isdir(os.path.join(Registered_dir, d)) and "_to_" in d
+    )
+    if not candidate_dirs:
+        raise FileNotFoundError(f"No folders matching '*_to_*' found in {Registered_dir} - run the Register step first.")
+    folder_name = candidate_dirs[0]
+    fix_phase = int(folder_name.split('_to_')[-1].split('R')[-1])
+
+    out_dir = os.path.join(Registered_dir, f"R{PHASE}_to_R{fix_phase}")
+    if not os.path.isdir(out_dir):
+        raise FileNotFoundError(f"Expected registration output folder not found: {out_dir} - run the Register step first.")
+
+    # yi2.sh names its outputs "{fixname}_To_{movname}_<suffix>" where
+    # fixname is R{PHASE} (the one that gets warped) and movname is
+    # R{fix_phase} (the reference grid) - see yi2.sh's own "fixname is the
+    # one will be warped" comment. A folder can also contain a stray
+    # R{fix_phase}_To_R{PHASE}_Warped.nii.gz from an earlier run in the
+    # opposite direction (confirmed on real data), so the direction tag
+    # must be checked explicitly rather than matching on "_Warped.nii"/
+    # "_Jacobian.nii" alone - a same-named file for the wrong direction
+    # silently reads real CT values off the wrong grid instead of failing,
+    # producing a plausible-looking but wrong TV/FV/J map.
+    direction_tag = f"R{PHASE}_To_"
+    jac_candidates = [os.path.join(out_dir, x) for x in os.listdir(out_dir)
+                       if direction_tag in x and "_Jacobian.nii" in x]
+    if not jac_candidates:
+        raise FileNotFoundError(f"No '*{direction_tag}*_Jacobian.nii*' file found in {out_dir} - run the Register step first.")
+
+    warped_candidates = [os.path.join(out_dir, x) for x in os.listdir(out_dir)
+                          if direction_tag in x and (x.endswith("_Warped.nii.gz") or x.endswith("_Warped.nii"))]
+    if not warped_candidates:
+        raise FileNotFoundError(f"No '*{direction_tag}*_Warped.nii*' file found in {out_dir} - run the Register step first.")
+
+    # TotalWarp.nii.gz (not the "_Forward" variant, hence the exact suffix
+    # match) is the displacement field defined on R{fix_phase}'s (EI's) own
+    # grid, pointing EI->EE - the EI-grid analogue of the Forward.nii.gz
+    # field _locate_diaphragm_warp_and_mask uses on R{PHASE}'s (EE's) grid.
+    # Used for the maps panels' whole-lung "Deformation" arrows.
+    total_warp_candidates = [os.path.join(out_dir, x) for x in os.listdir(out_dir)
+                              if direction_tag in x and x.endswith("_TotalWarp.nii.gz")]
+    if not total_warp_candidates:
+        raise FileNotFoundError(f"No '*{direction_tag}*_TotalWarp.nii.gz' file found in {out_dir} - run the Register step first.")
+
+    fixed_mask_candidates = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR)
+                              if f"R{fix_phase}_m.nii" in x]
+    if not fixed_mask_candidates:
+        raise FileNotFoundError(f"No mask file matching 'R{fix_phase}_m.nii*' found in {RESULTS_DIR}")
+
+    fixed_image_candidates = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR)
+                               if f"R{fix_phase}.nii" in x and "_m" not in x]
+    if not fixed_image_candidates:
+        raise FileNotFoundError(f"No raw image file matching 'R{fix_phase}.nii*' found in {RESULTS_DIR}")
+
+    return dict(
+        jacobian_path=jac_candidates[0],
+        warped_path=warped_candidates[0],
+        total_warp_path=total_warp_candidates[0],
+        fixed_mask_path=fixed_mask_candidates[0],
+        fixed_image_path=fixed_image_candidates[0],
+        fix_phase=fix_phase,
+    )
+
+
+def _locate_ee_grid_transform_files(main_dir, outname, PHASE=7):
+    """
+    Everything needed to resample R{fix_phase} (EI, R0 in practice) onto
+    R{PHASE}'s (EE's, R7's) own grid, plus the forward warp field needed to
+    build a Jacobian on that same grid - the reverse of what
+    _locate_analysis_maps_files gives (which puts everything on EI's grid,
+    the direction yi2.sh's own Warped.nii.gz/Jacobian.nii.gz use). Reuses
+    the *forward* transform chain (Warp2, Warp1, Affine) yi2.sh already
+    computed and used to build its own TotalWarp_Forward.nii.gz (a field
+    defined on R{PHASE}'s grid, pointing R{PHASE}->R{fix_phase}) - handing
+    that same chain to antsApplyTransforms with an image instead of asking
+    it to emit a field resamples that image onto R{PHASE}'s grid, with no
+    new antsRegistration run needed.
+    """
+    base = _locate_analysis_maps_files(main_dir, outname, PHASE=PHASE)
+    out_dir = os.path.dirname(base["jacobian_path"])
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    direction_tag = f"R{PHASE}_To_"
+
+    def _find_in_out_dir(suffix):
+        cands = [os.path.join(out_dir, x) for x in os.listdir(out_dir)
+                  if direction_tag in x and x.endswith(suffix)]
+        if not cands:
+            raise FileNotFoundError(f"No '*{direction_tag}*{suffix}' file found in {out_dir} - run the Register step first.")
+        return cands[0]
+
+    ee_reference_candidates = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR)
+                                if f"R{PHASE}.nii" in x and "_m" not in x]
+    if not ee_reference_candidates:
+        raise FileNotFoundError(f"No raw image file matching 'R{PHASE}.nii*' found in {RESULTS_DIR}")
+
+    ee_mask_candidates = [os.path.join(RESULTS_DIR, x) for x in os.listdir(RESULTS_DIR)
+                           if f"R{PHASE}_m.nii" in x]
+    if not ee_mask_candidates:
+        raise FileNotFoundError(f"No mask file matching 'R{PHASE}_m.nii*' found in {RESULTS_DIR}")
+
+    return dict(
+        warp2=_find_in_out_dir("outputPrefixResults2Warp.nii.gz"),
+        warp1=_find_in_out_dir("outputPrefixResults1Warp.nii.gz"),
+        affine=_find_in_out_dir("outputPrefixResults0GenericAffine.mat"),
+        forward_field=_find_in_out_dir("TotalWarp_Forward.nii.gz"),
+        ei_image_path=base["fixed_image_path"],       # R{fix_phase} (EI) raw image - to be resampled
+        ee_reference_path=ee_reference_candidates[0],  # R{PHASE} (EE) raw image - defines the target grid
+        ee_mask_path=ee_mask_candidates[0],
+        out_dir=out_dir,
+    )
+
+
+def get_ei_on_ee_grid(main_dir, outname, PHASE=7, overwrite=False, antspath=None):
+    """
+    Resample R{fix_phase} (EI)'s raw image onto R{PHASE}'s (EE's) own grid,
+    and compute a Jacobian determinant map natively on that same grid (the
+    native EE->EI direction, >1) via antsApplyTransforms /
+    CreateJacobianDeterminantImage directly (no new antsRegistration run -
+    see _locate_ee_grid_transform_files). Cached next to the rest of the
+    registration output; each file is skipped if it already exists and
+    overwrite is False.
+    """
+    files = _locate_ee_grid_transform_files(main_dir, outname, PHASE=PHASE)
+    out_dir = files["out_dir"]
+    antspath = Path(antspath) if antspath else DEFAULT_ANTSPATH
+
+    ei_on_ee_path = os.path.join(out_dir, "EI_on_EE_grid.nii.gz")
+    jac_on_ee_path = os.path.join(out_dir, "EE_grid_Jacobian.nii.gz")
+
+    if overwrite or not os.path.isfile(ei_on_ee_path):
+        cmd = [
+            str(antspath / "antsApplyTransforms.exe"), "-d", "3",
+            "-r", files["ee_reference_path"],
+            "-i", files["ei_image_path"],
+            "-o", ei_on_ee_path,
+            "-n", "Linear",
+            "-t", files["warp2"],
+            "-t", files["warp1"],
+            "-t", files["affine"],
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"antsApplyTransforms failed (EI onto EE grid):\n{result.stdout}\n{result.stderr}")
+
+    if overwrite or not os.path.isfile(jac_on_ee_path):
+        cmd = [
+            str(antspath / "CreateJacobianDeterminantImage.exe"), "3",
+            files["forward_field"], jac_on_ee_path, "0", "1",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"CreateJacobianDeterminantImage failed (EE grid):\n{result.stdout}\n{result.stderr}")
+
+    return dict(
+        ei_on_ee_path=ei_on_ee_path,
+        jac_on_ee_path=jac_on_ee_path,
+        ee_reference_path=files["ee_reference_path"],
+        ee_mask_path=files["ee_mask_path"],
+    )
+
+
+def _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir, num_slices=6, dpi=300):
+    """
+    Same TV/FV/J math as Analysis.save_maps_registrations_core, just fed a
+    single already-registered (ei, ee, jacobian) triple instead of indexing
+    into a 16-phase stack - see _locate_analysis_maps_files for where these
+    come from in this pipeline.
+    """
+    TV_path = os.path.join(maps_dir, 'TV.png')
+    FV_path = os.path.join(maps_dir, 'FV.png')
+    J_path = os.path.join(maps_dir, 'J.png')
+
+    fx = mask.any(axis=(1, 2))
+    fy = mask.any(axis=(0, 2))
+    fz = mask.any(axis=(0, 1))
+    pad = 4
+
+    def _crop(img):
+        out = (img * mask)[fx, :, :][:, fy, :][:, :, fz]
+        out = np.pad(out, pad, 'constant', constant_values=0).astype(np.float32)
+        out[out == 0] = np.nan
+        return out
+
+    ee_masked = _crop(ee_img)
+    ei_masked = _crop(ei_img)
+    J_masked = _crop(jac)
+
+    for smooth in (False, True):
+        ee_slices = get_x_slices_from_image(ee_masked, number_of_slices=num_slices,
+                                             coronal_axis=1, transpose=False, airways=False, smooth=smooth)
+        ei_slices = get_x_slices_from_image(ei_masked, number_of_slices=num_slices,
+                                             coronal_axis=1, transpose=False, airways=False, smooth=smooth)
+        J_slices = get_x_slices_from_image(J_masked, number_of_slices=num_slices,
+                                            coronal_axis=1, transpose=False, airways=False, smooth=smooth)
+        FV = 1 - np.divide(ee_slices * J_slices, ei_slices, where=ei_slices != 0)
+        J = 1 - J_slices
+        TV = ei_slices / -1000 - ee_slices / -1000
+        if smooth:
+            save_image_MI_style(FV, 0, 1, FV_path.replace(".png", "_smoothed.png"), dpi)
+            save_image_MI_style(J, 0, 1, J_path.replace(".png", "_smoothed.png"), dpi)
+            save_image_MI_style(TV, 0, 0.5, TV_path.replace(".png", "_smoothed.png"), dpi)
+        else:
+            save_image_MI_style(FV, 0, 1, FV_path, dpi)
+            save_image_MI_style(J, 0, 1, J_path, dpi)
+            save_image_MI_style(TV, 0, 0.5, TV_path, dpi)
+
+
+def get_maps_r7_r0(main_dir, outname, PHASE=7, overwrite=False):
+    """
+    Fill in the TV/FV/J maps (see _save_analysis_maps_from_pair) from this
+    pipeline's actual R{PHASE}_to_R{fix_phase} registration output, then
+    rebuild the combined maps.png. Analysis.get_maps() already produced
+    FRC/TLC by this point (from raw.npy/mask.npy, no registration needed) -
+    this only adds the three maps that need Register to have run.
+    """
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    maps_dir = os.path.join(RESULTS_DIR, "Maps")
+    os.makedirs(maps_dir, exist_ok=True)
+    TV_path = os.path.join(maps_dir, 'TV.png')
+    FV_path = os.path.join(maps_dir, 'FV.png')
+    J_path = os.path.join(maps_dir, 'J.png')
+    if not overwrite and all(os.path.isfile(p) for p in (TV_path, FV_path, J_path)):
+        return
+
+    files = _locate_analysis_maps_files(main_dir, outname, PHASE=PHASE)
+
+    ei_img = nib.load(files["fixed_image_path"]).get_fdata()
+    ee_img = nib.load(files["warped_path"]).get_fdata()
+    jac = nib.load(files["jacobian_path"]).get_fdata()
+    mask = nib.load(files["fixed_mask_path"]).get_fdata().astype(bool)
+
+    ei_img = gaussian_filter(ei_img, 1)
+    ee_img = gaussian_filter(ee_img, 1)
+    jac = gaussian_filter(jac, 1)
+
+    _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir)
+    save_combined_maps_figure(maps_dir)
+
+
+def _mask_bbox_crop(img, mask, pad=4):
+    # Same bounding-box crop as _save_analysis_maps_from_pair's local
+    # _crop() (mask, crop to the mask's own bounding box, NaN the
+    # background) - factored out here so get_maps_single_slice_panel can
+    # crop ei/ee/jacobian once and compute TV/FV/J directly on the still-3D
+    # result, instead of on an already-2D projection.
+    fx = mask.any(axis=(1, 2))
+    fy = mask.any(axis=(0, 2))
+    fz = mask.any(axis=(0, 1))
+    out = (img * mask)[fx, :, :][:, fy, :][:, :, fz]
+    out = np.pad(out, pad, 'constant', constant_values=0).astype(np.float32)
+    out[out == 0] = np.nan
+    return out
+
+
+# Which voxel axis each plane collapses to make its projection - matches
+# the "coronal_axis" convention already used throughout this pipeline
+# (Analysis.py/utils.py's get_x_slices_from_image calls all pass
+# coronal_axis=1 for this same data), extended the same way to sagittal
+# (collapse left/right) and axial (collapse superior/inferior).
+MAPS_PLANE_AXIS = {"coronal": 1, "sagittal": 0, "axial": 2}
+
+
+def _masked_axis_projection(image_3d, mask_3d, axis=1):
+    # Mean across the whole named axis instead of picking out individual
+    # slices, so the single 2D result reflects the entire lung volume, not
+    # just one cross-section through it - same idea as the diaphragm step's
+    # coronal *projection* (Y collapsed), just applied to a functional map
+    # instead of a point cloud, and generalized to any of the 3 planes.
+    # utils.get_x_slices_from_image has an "airways" mode meant to do
+    # exactly this, but it calls a filter_nan_gaussian_conserving() that
+    # doesn't exist anywhere in this codebase (pre-existing dead code,
+    # unrelated to this feature) - np.nanmean directly is the same core
+    # operation without that broken optional smoothing step.
+    masked = image_3d * mask_3d
+    cropped = crop_to_mask(masked, padding=4)
+    cropped[cropped == 0] = np.nan
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(cropped, axis=axis)
+
+
+def _coronal_projection(image_3d, mask_3d):
+    return _masked_axis_projection(image_3d, mask_3d, axis=MAPS_PLANE_AXIS["coronal"])
+
+
+# Which two world axes (0=X/L-R, 1=Y/A-P, 2=Z/S-I) are horizontal/vertical
+# for each plane's arrow projection - same convention as the diaphragm
+# step's PLANE_CONFIG (h/v), just keyed simply for this narrower use.
+DEFORMATION_PLANE_HV = {"coronal": (0, 2), "sagittal": (1, 2), "axial": (0, 1)}
+
+
+def _block_average_arrows(warp, affine, ai, aj, ak, ARROW_BLOCK=15, MIN_VOXELS_PER_ARROW=4):
+    """
+    Block-averages a displacement field over ARROW_BLOCK-voxel neighborhoods
+    of the given voxel indices, returning one arrow per block: its world-
+    space position, mean displacement vector, and full 3D magnitude (used
+    for arrow color). Same block-averaging the diaphragm 2D visualizations'
+    whole-lung arrows use (_diaphragm_2d_arrays) - duplicated here rather
+    than shared, to avoid touching that already-tested function for an
+    unrelated feature.
+    """
+    block_id = np.stack([ai // ARROW_BLOCK, aj // ARROW_BLOCK, ak // ARROW_BLOCK], axis=1)
+    uniq_blocks, inverse = np.unique(block_id, axis=0, return_inverse=True)
+    vecs_all = warp[ai, aj, ak, :]
+    n_blocks = len(uniq_blocks)
+    vec_sums = np.zeros((n_blocks, 3))
+    idx_sums = np.zeros((n_blocks, 3))
+    counts = np.zeros(n_blocks)
+    np.add.at(vec_sums, inverse, vecs_all)
+    np.add.at(idx_sums, inverse, np.stack([ai, aj, ak], axis=1).astype(float))
+    np.add.at(counts, inverse, 1)
+    keep_blocks = counts >= MIN_VOXELS_PER_ARROW
+    if keep_blocks.sum() == 0:
+        keep_blocks = counts >= 1
+    mean_vecs = vec_sums[keep_blocks] / counts[keep_blocks, None]
+    mean_idx = idx_sums[keep_blocks] / counts[keep_blocks, None]
+    arrow_vox = np.concatenate([mean_idx, np.ones((len(mean_idx), 1))], axis=1)
+    arrow_world = (affine @ arrow_vox.T).T[:, :3]
+    arrow_norm = np.linalg.norm(mean_vecs, axis=1)
+    return arrow_world, mean_vecs, arrow_norm
+
+
+def _render_deformation_panel(ax, warp, mask, affine, plane, vmin=0.0, vmax=5.0):
+    """
+    Draws whole-lung block-averaged displacement arrows (colored by full 3D
+    magnitude) over a gray lung silhouette, projected onto `plane` - the
+    maps panels' "Deformation" column. Same visual idea as the diaphragm
+    step's whole-lung arrows (diaphragm_2D_visualization_*.jpg), reusing
+    _block_average_arrows instead of _diaphragm_2d_arrays since this needs
+    no side-split, diaphragm-region highlighting, or orientation labels -
+    just the arrows and enough context to see where they sit in the lung.
+    """
+    h_idx, v_idx = DEFORMATION_PLANE_HV[plane]
+
+    ai, aj, ak = np.where(mask)
+    stride_n = max(2 ** 3, 1)
+    si, sj, sk = ai[::stride_n], aj[::stride_n], ak[::stride_n]
+    vox = np.stack([si, sj, sk, np.ones_like(si)], axis=1).astype(float)
+    world = (affine @ vox.T).T[:, :3]
+
+    arrow_world, mean_vecs, arrow_norm = _block_average_arrows(warp, affine, ai, aj, ak)
+
+    ax.set_facecolor("black")
+    ax.scatter(world[:, h_idx], world[:, v_idx], s=4, c="gray", alpha=0.3)
+    q = ax.quiver(arrow_world[:, h_idx], arrow_world[:, v_idx],
+                  mean_vecs[:, h_idx], mean_vecs[:, v_idx], arrow_norm,
+                  cmap="jet", angles="xy", scale_units="xy", scale=1,
+                  width=0.012, headwidth=4.5, headlength=5.5, headaxislength=5, zorder=5)
+    q.set_clim(vmin, vmax)
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    return q
+
+
+def _render_maps_panel(panels, out_path, title, plane="coronal"):
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), dpi=200, facecolor="black")
+    axes = np.atleast_1d(axes)
+    for ax, (name, arr, vmin, vmax) in zip(axes, panels):
+        if name == "Deformation":
+            warp, mask, affine = arr
+            im = _render_deformation_panel(ax, warp, mask, affine, plane, vmin=vmin, vmax=vmax)
+        else:
+            im = ax.imshow(arr.T, origin="lower", cmap="jet", vmin=vmin, vmax=vmax)
+            ax.axis("off")
+        ax.set_title(name, color="white", fontsize=18)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.yaxis.set_tick_params(color="white")
+        plt.setp(cbar.ax.get_yticklabels(), color="white")
+    fig.suptitle(title, color="white", fontsize=16)
+    plt.savefig(out_path, bbox_inches="tight", dpi=200, facecolor="black")
+    plt.close(fig)
+
+
+def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", overwrite=False):
+    """
+    One combined image, single `plane` projection per map (FRC, TLC, TV, FV,
+    J), everything expressed on R{fix_phase}'s (EI's, R0 in practice) own
+    grid - the direction yi2.sh's own Warped.nii.gz/Jacobian.nii.gz come in,
+    so no resampling needed here (see get_maps_single_slice_panel_ee for the
+    EE-anchored counterpart, which does need an extra resampling step). Uses
+    the native EI->EE Jacobian (<1) exactly as get_maps_r7_r0/maps.png do.
+    """
+    if plane not in MAPS_PLANE_AXIS:
+        raise ValueError(f"plane must be one of {sorted(MAPS_PLANE_AXIS)}, got {plane!r}")
+    axis = MAPS_PLANE_AXIS[plane]
+
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    maps_dir = os.path.join(RESULTS_DIR, "Maps")
+    os.makedirs(maps_dir, exist_ok=True)
+    out_path = os.path.join(maps_dir, f"maps_panel_EI_{plane}.jpg")
+    if not overwrite and os.path.isfile(out_path):
+        return out_path
+
+    files = _locate_analysis_maps_files(main_dir, outname, PHASE=PHASE)
+    ei_mask = nib.load(files["fixed_mask_path"]).get_fdata().astype(bool)
+    ei_own_img = gaussian_filter(nib.load(files["fixed_image_path"]).get_fdata(), 1)
+    ee_on_ei_img = gaussian_filter(nib.load(files["warped_path"]).get_fdata(), 1)
+    jac_on_ei = gaussian_filter(nib.load(files["jacobian_path"]).get_fdata(), 1)  # native EI->EE, <1
+
+    panels = [
+        ("FRC", _masked_axis_projection(ee_on_ei_img / -1000, ei_mask, axis=axis), 0, 1),
+        ("TLC", _masked_axis_projection(ei_own_img / -1000, ei_mask, axis=axis), 0, 1),
+    ]
+
+    # TV/FV/J computed voxel-wise in 3D first, THEN collapsed to 2D by
+    # averaging - see get_maps_single_slice_panel_ee's longer comment on why
+    # (FV's ratio is nonlinear, so the order matters for it specifically).
+    ei_masked = _mask_bbox_crop(ei_own_img, ei_mask)
+    ee_masked = _mask_bbox_crop(ee_on_ei_img, ei_mask)
+    jac_masked = _mask_bbox_crop(jac_on_ei, ei_mask)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        FV_3d = 1 - np.divide(ee_masked * jac_masked, ei_masked, where=ei_masked != 0)
+    FV_3d = np.clip(FV_3d, 0.0, 1.0)  # see the EE panel's comment - a handful of near-zero-denominator voxels can otherwise wreck a whole averaged column
+    J_map_3d = 1 - jac_masked
+    TV_3d = ei_masked / -1000 - ee_masked / -1000
+
+    with np.errstate(invalid="ignore"):
+        panels.append(("TV", np.nanmean(TV_3d, axis=axis), 0, 0.5))
+        panels.append(("FV", np.nanmean(FV_3d, axis=axis), 0, 1))
+        panels.append(("J", np.nanmean(J_map_3d, axis=axis), 0, 1))
+
+    # Whole-lung displacement arrows, on EI's own grid: TotalWarp.nii.gz
+    # points EI->EE (see _locate_analysis_maps_files), the EI-grid analogue
+    # of the Forward.nii.gz field the EE panel uses.
+    ei_mask_nii = nib.load(files["fixed_mask_path"])
+    total_warp = np.asarray(nib.load(files["total_warp_path"]).dataobj).squeeze()
+    panels.append(("Deformation", (total_warp, ei_mask, ei_mask_nii.affine), 0.0, 5.0))
+
+    _render_maps_panel(panels, out_path, f"R0 (EI) functional maps - single {plane} projection", plane=plane)
+    return out_path
+
+
+def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", overwrite=False):
+    """
+    EE-anchored counterpart of get_maps_single_slice_panel_ei: every map
+    expressed on R{PHASE}'s (EE's, R7 in practice) own grid instead, using
+    EI resampled onto that grid and the *native* EE->EI Jacobian (>1,
+    "how much did this bit of EE tissue expand to become EI") - see
+    get_ei_on_ee_grid. Both FV and J use this same native Jacobian, not an
+    inverted/resampled EI->EE one, so this panel is self-contained: every
+    quantity in it is computed on EE's own grid using EE->EI-direction
+    fields, mirroring how the EI panel uses only EI->EE-direction ones.
+
+    FV keeps the EI panel's exact formula shape (1-(ee*jac_EI->EE)/ei) -
+    dividing by the native EE->EI jacobian instead of multiplying by an
+    EI->EE one is the same arithmetic (x/j == x*(1/j)), so this already
+    uses jac_on_ee directly; there's no separate "inverted" copy of it.
+    J displays jac_on_ee itself, uncapped and >1, since the user wants the
+    expansion factor shown as what it actually is rather than remapped
+    into the EI panel's 0-1 "amount of shrinkage" framing.
+    """
+    if plane not in MAPS_PLANE_AXIS:
+        raise ValueError(f"plane must be one of {sorted(MAPS_PLANE_AXIS)}, got {plane!r}")
+    axis = MAPS_PLANE_AXIS[plane]
+
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    maps_dir = os.path.join(RESULTS_DIR, "Maps")
+    os.makedirs(maps_dir, exist_ok=True)
+    out_path = os.path.join(maps_dir, f"maps_panel_EE_{plane}.jpg")
+    if not overwrite and os.path.isfile(out_path):
+        return out_path
+
+    raw_path = os.path.join(RESULTS_DIR, 'raw.npy')
+    mask_path = os.path.join(RESULTS_DIR, 'mask.npy')
+    if not os.path.isfile(raw_path) or not os.path.isfile(mask_path):
+        raise FileNotFoundError(f"raw.npy/mask.npy not found in {RESULTS_DIR} - run the Segment step first.")
+
+    imgs = np.load(raw_path)
+    masks = np.load(mask_path)
+    sizes = masks.sum(axis=(1, 2, 3))
+    ee_index = int(np.argmin(sizes))
+
+    panels = [("FRC", _masked_axis_projection(gaussian_filter(imgs[ee_index], 1) / -1000, masks[ee_index], axis=axis), 0, 1)]
+
+    ee_grid_files = get_ei_on_ee_grid(main_dir, outname, PHASE=PHASE, overwrite=False)
+    ee_mask = nib.load(ee_grid_files["ee_mask_path"]).get_fdata().astype(bool)
+    ei_on_ee_img = gaussian_filter(nib.load(ee_grid_files["ei_on_ee_path"]).get_fdata(), 1)
+    ee_own_img = gaussian_filter(nib.load(ee_grid_files["ee_reference_path"]).get_fdata(), 1)
+    jac_on_ee = gaussian_filter(nib.load(ee_grid_files["jac_on_ee_path"]).get_fdata(), 1)  # native EE->EI, >1
+
+    panels.append(("TLC", _masked_axis_projection(ei_on_ee_img / -1000, ee_mask, axis=axis), 0, 1))
+
+    ei_masked = _mask_bbox_crop(ei_on_ee_img, ee_mask)
+    ee_masked = _mask_bbox_crop(ee_own_img, ee_mask)
+    jac_masked = _mask_bbox_crop(jac_on_ee, ee_mask)  # native EE->EI, >1 - used directly for both FV and J
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        FV_3d = 1 - np.divide(ee_masked, ei_masked * jac_masked, where=(ei_masked * jac_masked) != 0)
+    # FV is a per-voxel ratio, so any voxel where the denominator lands very
+    # close to zero (confirmed on real data - a cluster of voxels near the
+    # trachea wall, where smoothing pulls the HU value right through zero)
+    # blows up to +-1000s. That's a handful of voxels, but enough to drag
+    # np.nanmean for their entire AP column once projected to 2D, showing up
+    # as an isolated blown-out streak rather than a smooth map. Clamping to
+    # FV's own displayed range (0-1) keeps that from propagating.
+    FV_3d = np.clip(FV_3d, 0.0, 1.0)
+    # J shows the native expansion jacobian directly, unmodified - it's
+    # generally >1, so no clipping to a 0-1 range like the other maps.
+    J_map_3d = jac_masked
+    TV_3d = ei_masked / -1000 - ee_masked / -1000
+
+    with np.errstate(invalid="ignore"):
+        panels.append(("TV", np.nanmean(TV_3d, axis=axis), 0, 0.5))
+        panels.append(("FV", np.nanmean(FV_3d, axis=axis), 0, 1))
+        # Fixed 1-2 scale (not a per-session dynamic max) so J stays
+        # comparable across sessions/rats, same as every other map here
+        # using a fixed vmin/vmax - real data on this dataset ranged about
+        # 1.0-1.8, so 2.0 leaves headroom without washing out the detail.
+        panels.append(("J", np.nanmean(J_map_3d, axis=axis), 1.0, 2.0))
+
+    # Whole-lung displacement arrows, on EE's own grid: Forward.nii.gz
+    # points EE->EI (see _locate_diaphragm_warp_and_mask), the same field
+    # the diaphragm step's whole-lung arrows already use.
+    ee_mask_nii = nib.load(ee_grid_files["ee_mask_path"])
+    forward_warp_path, _, _, _ = _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE)
+    forward_warp = np.asarray(nib.load(forward_warp_path).dataobj).squeeze()
+    panels.append(("Deformation", (forward_warp, ee_mask, ee_mask_nii.affine), 0.0, 5.0))
+
+    _render_maps_panel(panels, out_path, f"R{PHASE} (EE) functional maps - single {plane} projection", plane=plane)
+    return out_path
+
+
+def _stack_panel_images_vertically(image_paths, out_path):
+    # Stacks already-rendered panel JPGs (each a full row of maps with its
+    # own colorbars/title) directly, rather than re-plotting from scratch -
+    # same pattern Analysis.save_combined_maps_figure uses to build maps.png
+    # from FRC.png/TLC.png/etc.
+    from PIL import Image as PILImage
+    imgs = [PILImage.open(p).convert("RGB") for p in image_paths]
+    max_w = max(im.width for im in imgs)
+    padded = []
+    for im in imgs:
+        if im.width < max_w:
+            canvas = PILImage.new("RGB", (max_w, im.height), (0, 0, 0))
+            canvas.paste(im, ((max_w - im.width) // 2, 0))
+            im = canvas
+        padded.append(im)
+    total_h = sum(im.height for im in padded)
+    out = PILImage.new("RGB", (max_w, total_h), (0, 0, 0))
+    y = 0
+    for im in padded:
+        out.paste(im, (0, y))
+        y += im.height
+    out.save(out_path)
+
+
+def get_maps_all_slice_panels(main_dir, outname, PHASE=7, overwrite=False):
+    """
+    Generates every single-slice map panel this pipeline supports: coronal/
+    sagittal/axial for both the EI and EE frames (6 files), plus one
+    combined "*_all_slice.jpg" per frame stacking coronal (top), sagittal
+    (middle), and axial (bottom) - 2 more files, 8 total. Returns a dict of
+    all 8 paths, keyed "{EI,EE}_{coronal,sagittal,axial}" and
+    "{EI,EE}_all_slice".
+    """
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    maps_dir = os.path.join(RESULTS_DIR, "Maps")
+
+    paths = {}
+    for frame, panel_fn in (("EI", get_maps_single_slice_panel_ei), ("EE", get_maps_single_slice_panel_ee)):
+        plane_paths = []
+        for plane in ("coronal", "sagittal", "axial"):
+            p = panel_fn(main_dir, outname, PHASE=PHASE, plane=plane, overwrite=overwrite)
+            paths[f"{frame}_{plane}"] = p
+            plane_paths.append(p)
+
+        all_slice_path = os.path.join(maps_dir, f"maps_panel_{frame}_all_slice.jpg")
+        if overwrite or not os.path.isfile(all_slice_path):
+            _stack_panel_images_vertically(plane_paths, all_slice_path)
+        paths[f"{frame}_all_slice"] = all_slice_path
+
+    return paths
+
+
+def build_rat_coronal_maps_panel(rat_dir, outname, frame="EI"):
+    """
+    Stacks every session's own coronal functional-maps panel
+    (maps_panel_{frame}_coronal.jpg from get_maps_single_slice_panel_ei/_ee
+    - FRC, TLC, TV, FV, J, Deformation columns) into one combined image
+    under <rat_dir>/Analysis, one row per session in chronological order
+    (top = earliest/first timepoint, same ordering as
+    get_rat_session_dirs) - lets you see how each functional map changes
+    session to session at a glance, each row labeled with its session
+    name. `frame` is "EI" (R0-anchored) or "EE" (R7-anchored, in
+    practice) - the two panel flavors get_maps_single_slice_panel_ei/_ee
+    produce; call this once for each to get both files. Rebuilt from
+    scratch every time (like volume_analysis_step's CSV, just as a fresh
+    render rather than an upsert, since row images can't be edited in
+    place), so it always reflects whichever sessions currently have that
+    panel. Sessions that haven't run Analysis yet (no
+    maps_panel_{frame}_coronal.jpg) are skipped rather than failing the
+    whole thing. Returns None if no session has that panel yet.
+    """
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+
+    rows = []
+    for session_dir in get_rat_session_dirs(rat_dir):
+        panel_path = os.path.join(session_dir, outname, "Results", "Maps", f"maps_panel_{frame}_coronal.jpg")
+        if os.path.isfile(panel_path):
+            rows.append((os.path.basename(os.path.normpath(session_dir)), panel_path))
+        else:
+            print(f"Rat {frame} coronal maps panel: skipping {session_dir} "
+                  f"(no maps_panel_{frame}_coronal.jpg - run Analysis there first).")
+    if not rows:
+        print(f"Rat {frame} coronal maps panel: no session panels found under {rat_dir} - nothing to combine.")
+        return None
+
+    try:
+        font = ImageFont.truetype("arial.ttf", 30)
+    except Exception:
+        font = ImageFont.load_default()
+
+    labeled = []
+    for session_name, panel_path in rows:
+        im = PILImage.open(panel_path).convert("RGB")
+        draw = ImageDraw.Draw(im)
+        bbox = draw.textbbox((0, 0), session_name, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.rectangle([0, 0, tw + 16, th + 16], fill=(0, 0, 0))
+        draw.text((8, 8), session_name, fill=(255, 255, 0), font=font)
+        labeled.append(im)
+
+    max_w = max(im.width for im in labeled)
+    padded = []
+    for im in labeled:
+        if im.width < max_w:
+            canvas = PILImage.new("RGB", (max_w, im.height), (0, 0, 0))
+            canvas.paste(im, ((max_w - im.width) // 2, 0))
+            im = canvas
+        padded.append(im)
+    total_h = sum(im.height for im in padded)
+    combined = PILImage.new("RGB", (max_w, total_h), (0, 0, 0))
+    y = 0
+    for im in padded:
+        combined.paste(im, (0, y))
+        y += im.height
+
+    analysis_dir = os.path.join(rat_dir, "Analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+    out_path = os.path.join(analysis_dir, f"coronal_maps_all_sessions_{frame}.jpg")
+    combined.save(out_path)
+    return out_path
+
+
 def _find_diaphragm_lr_split_index(ai, x_size, search_band=(0.3, 0.7)):
     counts = np.bincount(ai, minlength=x_size)
     nz = np.where(counts > 0)[0]
@@ -468,6 +1214,178 @@ def _split_diaphragm_left_right(ai, x_size, affine):
     is_right = (ai > split_idx) if higher_index_is_right else (ai < split_idx)
     is_left = ~is_right
     return is_left, is_right, split_idx
+
+
+def _higher_worldx_is_right(affine):
+    # Same empirically-corrected laterality _split_diaphragm_left_right
+    # uses (the header's own axis code reads backwards for this pipeline's
+    # data), just re-expressed for world-X comparisons instead of raw
+    # voxel-index comparisons, since the manual split/airway lines are
+    # drawn and stored in world mm coordinates.
+    axis0_code = nib.aff2axcodes(affine)[0]
+    higher_index_is_right = (axis0_code != "R")
+    return higher_index_is_right if affine[0, 0] > 0 else (not higher_index_is_right)
+
+
+def _split_override_path(main_dir, outname):
+    return os.path.join(main_dir, outname, "Results", "lr_split_override.json")
+
+
+def load_lr_split_override(main_dir, outname):
+    """
+    A manually-drawn replacement for _split_diaphragm_left_right's single-
+    threshold heuristic, saved by the app's Left/Right Split editor - see
+    save_lr_split_override. Returns None if this session has no override
+    (the normal case), in which case callers should fall back to the
+    automatic method.
+    """
+    path = _split_override_path(main_dir, outname)
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
+
+
+def save_lr_split_override(main_dir, outname, split_points, airway_points,
+                            split_slices=None, airway_slices=None):
+    """
+    split_points: list of [x_mm, y_mm] world-coordinate points in the
+    axial (X/Y) plane, drawn by the user - interpolated as a piecewise-
+    linear curve giving the L/R boundary's X position as a function of Y
+    (anterior-posterior), so it can bend to follow the mediastinal gap's
+    actual shape instead of the automatic method's single global X
+    threshold. This is the coarse, whole-volume fallback.
+    airway_points: list of [x_mm, z_mm] world-coordinate points in the
+    coronal (X/Z) plane, forming a closed polygon around the trachea/main
+    bronchi - at least 3 points to enclose an area. Any voxel whose (X,
+    Z) position falls inside this polygon is excluded from both lungs
+    instead of being arbitrarily assigned to whichever side of the split
+    it happens to fall on. Also a coarse, whole-volume fallback.
+    split_slices/airway_slices: optional dicts of {array Y-index (as a
+    string): points} - per-coronal-slice refinements drawn one slice at a
+    time (App.LRSplitEditor's "This slice only" scope), each entry a line
+    (split, [x_mm, z_mm] points) or closed polygon (airway) in that one
+    slice's own X/Z plane. When either is non-empty it takes over
+    entirely from the matching whole-volume fallback above - see
+    classify_lr_with_override for exactly how.
+    """
+    if len(split_points) < 2 and not split_slices:
+        raise ValueError("split_points needs at least 2 points to define a line "
+                          "(or at least one per-slice split line).")
+    path = _split_override_path(main_dir, outname)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(dict(split_points=split_points, airway_points=airway_points,
+                        split_slices=split_slices or {}, airway_slices=airway_slices or {}), f, indent=2)
+    return path
+
+
+def _interp_line_x(points, coord_values):
+    # Piecewise-linear interpolation of a hand-drawn line's X position at
+    # given values of its independent coordinate (Y for the split line,
+    # Z for the airway line - see classify_lr_with_override) - np.interp
+    # requires increasing independent values and clamps outside the drawn
+    # range to the nearest endpoint rather than extrapolating, which is
+    # the sensible behavior for a line the user only drew over part of
+    # the lung's full extent.
+    pts = sorted(points, key=lambda p: p[1])
+    coords = np.array([p[1] for p in pts], dtype=float)
+    xs = np.array([p[0] for p in pts], dtype=float)
+    return np.interp(coord_values, coords, xs)
+
+
+def _axis_for_world_row(affine, row):
+    # Which array axis (0,1,2) a world coordinate row (0=X,1=Y,2=Z) comes
+    # from - the column with the dominant entry in that affine row. Valid
+    # for the axis-aligned (no rotation/oblique) affines this whole
+    # override system already assumes (see _higher_worldx_is_right).
+    return int(np.argmax(np.abs(affine[row, :3])))
+
+
+def _world_to_slice_index(world_coord, affine, row, axis):
+    return np.round((world_coord - affine[row, 3]) / affine[row, axis]).astype(int)
+
+
+def _nearest_edited_slice(slice_idx, edited_keys_sorted):
+    # For each voxel's own Y-slice index, which EDITED slice (from a
+    # sparse, possibly tiny set) is closest - lets a correction on a
+    # handful of slices propagate to every untouched slice around it,
+    # instead of requiring the user to redraw every single slice by hand.
+    if len(edited_keys_sorted) == 1:
+        return np.full(slice_idx.shape, edited_keys_sorted[0])
+    pos = np.searchsorted(edited_keys_sorted, slice_idx)
+    pos = np.clip(pos, 1, len(edited_keys_sorted) - 1)
+    left = edited_keys_sorted[pos - 1]
+    right = edited_keys_sorted[pos]
+    return np.where((right - slice_idx) < (slice_idx - left), right, left)
+
+
+def classify_lr_with_override(world_x, world_y, world_z, override, affine):
+    """
+    world_x/world_y/world_z: 1D arrays of voxel world coordinates.
+    override: dict from load_lr_split_override (or freshly constructed the
+    same shape while editing). Two ways to define each boundary:
+
+      - a single whole-volume curve/polygon (split_points: X as f(Y),
+        drawn on the axial X/Y projection; airway_points: a closed X/Z
+        polygon, drawn on the coronal projection) applied to every voxel
+        regardless of where it sits along Y - the original, coarse
+        method.
+      - per-coronal-slice refinements (split_slices/airway_slices: dicts
+        of {array Y-index (str): points}), each a line (split) or closed
+        polygon (airway) drawn in that one slice's own X/Z plane (see
+        App.LRSplitEditor's "This slice only" scope). When either dict is
+        non-empty, EVERY voxel uses whichever edited slice is nearest to
+        it along Y for that boundary - not just voxels that fall exactly
+        on an edited slice - so touching up a handful of slices refines
+        the neighborhood around them too, and this replaces the matching
+        whole-volume fallback entirely rather than blending with it.
+
+    Returns (is_left, is_right, is_airway) boolean arrays of the same
+    length - airway voxels are excluded from both is_left and is_right,
+    matching how a manually-traced airway should be handled (neither
+    lung, not double-counted).
+    """
+    higher_worldx_is_right = _higher_worldx_is_right(affine)
+    y_axis = _axis_for_world_row(affine, 1)
+
+    split_slices = override.get("split_slices") or {}
+    if split_slices:
+        keys = np.array(sorted(int(k) for k in split_slices.keys()))
+        slice_idx = _world_to_slice_index(world_y, affine, 1, y_axis)
+        nearest = _nearest_edited_slice(slice_idx, keys)
+        split_x = np.zeros(world_x.shape, dtype=float)
+        for k in keys:
+            m = nearest == k
+            if m.any():
+                split_x[m] = _interp_line_x(split_slices[str(int(k))], world_z[m])
+    else:
+        split_x = _interp_line_x(override["split_points"], world_y)
+    is_right_side = (world_x > split_x) if higher_worldx_is_right else (world_x < split_x)
+
+    is_airway = np.zeros(world_x.shape, dtype=bool)
+    airway_slices = override.get("airway_slices") or {}
+    if airway_slices:
+        keys = np.array(sorted(int(k) for k in airway_slices.keys()))
+        slice_idx = _world_to_slice_index(world_y, affine, 1, y_axis)
+        nearest = _nearest_edited_slice(slice_idx, keys)
+        for k in keys:
+            pts = airway_slices[str(int(k))]
+            if len(pts) < 3:
+                continue
+            m = nearest == k
+            if m.any():
+                polygon = MplPath(np.asarray(pts, dtype=float))
+                is_airway[m] = polygon.contains_points(np.column_stack([world_x[m], world_z[m]]))
+    else:
+        airway_points = override.get("airway_points") or []
+        if len(airway_points) >= 3:
+            polygon = MplPath(np.asarray(airway_points, dtype=float))
+            is_airway = polygon.contains_points(np.column_stack([world_x, world_z]))
+
+    is_right = is_right_side & ~is_airway
+    is_left = (~is_right_side) & ~is_airway
+    return is_left, is_right, is_airway
 
 
 _DIAPHRAGM_REGION_CACHE = {}
@@ -1284,11 +2202,52 @@ def run(main_dir, steps, threshold=0.5, announce_done=True):
             return 1
         log_done("segment")
 
+    if "segment_lr" in steps:
+        log_step("segment_lr")
+        try:
+            for p in segment_lr_step(main_dir, outname):
+                log_artifact(p)
+        except Exception as e:
+            log_failed("segment_lr", e)
+            return 1
+        log_done("segment_lr")
+
     if "analysis" in steps:
         log_step("analysis")
         try:
             get_maps(main_dir, outname=outname, overwrite=False)
+            # get_maps() only ever fills in FRC/TLC (needs Segment, not
+            # Register) - TV/FV/J need a completed registration, which this
+            # pipeline stores as a per-phase-pair R7_to_R0 folder rather
+            # than the all-phase registered.npy/jacobian.npy get_maps()
+            # looks for, so it silently skips them. Fill those three in
+            # from the actual R7/R0 registration when it exists.
+            try:
+                get_maps_r7_r0(main_dir, outname, overwrite=False)
+                print("TV/FV/J maps generated from the R7/R0 registration.")
+            except FileNotFoundError as e:
+                print(f"TV/FV/J maps skipped (no registration yet): {e}")
             log_artifact(os.path.join(main_dir, outname, 'Results', 'Maps', 'maps.png'))
+            try:
+                for key, p in get_maps_all_slice_panels(main_dir, outname, overwrite=False).items():
+                    log_artifact(p)
+            except FileNotFoundError as e:
+                print(f"Single-slice panels skipped (no registration yet): {e}")
+
+            # Rat-level view across sessions: rebuilt from every session's
+            # own maps_panel_{EI,EE}_coronal.jpg each time Analysis runs,
+            # so it always reflects whichever sessions have that panel so
+            # far - a missing/failed panel here shouldn't fail this
+            # session's own (already-succeeded) analysis, so it's a soft
+            # warning per frame, not a step failure.
+            rat_dir = os.path.dirname(os.path.normpath(main_dir))
+            for frame in ("EI", "EE"):
+                try:
+                    rat_panel_path = build_rat_coronal_maps_panel(rat_dir, outname, frame=frame)
+                    if rat_panel_path:
+                        log_artifact(rat_panel_path)
+                except Exception as e:
+                    print(f"Rat-level {frame} coronal maps panel skipped: {e}")
         except Exception as e:
             log_failed("analysis", e)
             return 1
@@ -1304,6 +2263,24 @@ def run(main_dir, steps, threshold=0.5, announce_done=True):
             return 1
         log_done("register")
 
+    if "register_all_phases" in steps:
+        # Every phase (1-15) registered onto R0/EI, not just the one phase
+        # ("register" above only does phase 7 by default) - needed for a
+        # per-voxel "expansion time" map (each voxel's own phase in the
+        # cycle, from all 16 phases' Jacobians against a shared EI
+        # reference) rather than a single EI/EE snapshot. Much slower than
+        # "register" (15 registrations instead of 1), so it's its own
+        # opt-in step rather than folded into "register".
+        log_step("register_all_phases")
+        try:
+            failures = register_step(main_dir, outname, EE_toEI_only=False)
+            if failures:
+                print(f"Some phases failed to register to R0: {failures}")
+        except Exception as e:
+            log_failed("register_all_phases", e)
+            return 1
+        log_done("register_all_phases")
+
     if "diaphragm" in steps:
         log_step("diaphragm")
         try:
@@ -1312,6 +2289,15 @@ def run(main_dir, steps, threshold=0.5, announce_done=True):
             log_failed("diaphragm", e)
             return 1
         log_done("diaphragm")
+
+    if "volume_analysis" in steps:
+        log_step("volume_analysis")
+        try:
+            volume_analysis_step(main_dir, outname)
+        except Exception as e:
+            log_failed("volume_analysis", e)
+            return 1
+        log_done("volume_analysis")
 
     if announce_done:
         print("\n===ALL_DONE===", flush=True)
@@ -1337,6 +2323,393 @@ def get_rat_session_dirs(rat_dir):
         os.path.join(rat_dir, d) for d in os.listdir(rat_dir)
         if os.path.isdir(os.path.join(rat_dir, d)) and date_pattern.match(d)
     )
+
+
+def compute_session_lung_volumes(main_dir, outname):
+    """
+    Air volume (mL) at this session's own true end-inspiration (largest
+    lung mask across the 16-phase cycle) and end-expiration (smallest)
+    phases, split into left/right lungs at the mediastinal gap - the same
+    direct, registration-independent method used throughout this
+    conversation's manual FRC/TLC/TV checks. Needs only raw.npy/mask.npy/
+    affine.npy (the Segment step), no Register step required, and uses
+    each session's own detected EI/EE phase rather than assuming a fixed
+    phase number - confirmed on real data that the true min/max-volume
+    phase varies session to session (e.g. one PhNd31 session's true EE
+    was phase 11, another's was phase 10, neither is the pipeline's
+    default registration phase 7).
+
+    Raises FileNotFoundError if the Segment step hasn't been run yet.
+    """
+    RESULTS_DIR = os.path.join(main_dir, outname, "Results")
+    raw_path = os.path.join(RESULTS_DIR, "raw.npy")
+    mask_path = os.path.join(RESULTS_DIR, "mask.npy")
+    affine_path = os.path.join(RESULTS_DIR, "affine.npy")
+    for p in (raw_path, mask_path, affine_path):
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"{p} not found - run the Segment step first.")
+
+    imgs = np.load(raw_path)
+    masks = np.load(mask_path)
+    affine = np.load(affine_path)
+    zooms = np.abs(np.diag(affine))[:3]
+    voxel_vol_mm3 = float(zooms[0] * zooms[1] * zooms[2])
+
+    sizes = masks.sum(axis=(1, 2, 3))
+    ei_phase, ee_phase = int(np.argmax(sizes)), int(np.argmin(sizes))
+    override = load_lr_split_override(main_dir, outname)
+
+    def air_ml(img, ai, aj, ak):
+        return float((img[ai, aj, ak] / -1000.0).sum() * voxel_vol_mm3 / 1000.0)
+
+    def phase_lr(phase_idx):
+        mask = masks[phase_idx].astype(bool)
+        ai, aj, ak = np.where(mask)
+        img = imgs[phase_idx]
+        if override is not None:
+            # Manually-drawn split/airway lines (see the app's Left/Right
+            # Split editor) - a bent, Y-dependent split boundary instead
+            # of the automatic method's single global X threshold, and
+            # airway voxels excluded from both sides rather than
+            # arbitrarily assigned to whichever falls on one side of that
+            # threshold.
+            vox = np.stack([ai, aj, ak, np.ones_like(ai)], axis=1).astype(float)
+            world = (affine @ vox.T).T[:, :3]
+            is_left, is_right, _ = classify_lr_with_override(
+                world[:, 0], world[:, 1], world[:, 2], override, affine)
+        else:
+            is_left, is_right, _ = _split_diaphragm_left_right(ai, mask.shape[0], affine)
+        return (air_ml(img, ai[is_left], aj[is_left], ak[is_left]),
+                air_ml(img, ai[is_right], aj[is_right], ak[is_right]))
+
+    tlc_left, tlc_right = phase_lr(ei_phase)
+    frc_left, frc_right = phase_lr(ee_phase)
+
+    return dict(
+        ei_phase=ei_phase, ee_phase=ee_phase,
+        frc_left_ml=frc_left, frc_right_ml=frc_right,
+        tlc_left_ml=tlc_left, tlc_right_ml=tlc_right,
+        tv_left_ml=tlc_left - frc_left, tv_right_ml=tlc_right - frc_right,
+    )
+
+
+VOLUME_ANALYSIS_CSV_FIELDS = [
+    "session", "ei_phase", "ee_phase",
+    "frc_left_mL", "frc_right_mL", "frc_total_mL",
+    "tlc_left_mL", "tlc_right_mL", "tlc_total_mL",
+    "tv_left_mL", "tv_right_mL", "tv_total_mL",
+]
+
+
+def save_lr_split_panel(mask, affine, out_path, title="", override=None):
+    """
+    2-panel (coronal, axial) illustration of the left/right lung split:
+    every mask voxel projected and colored left (blue) or right (red),
+    with the split boundary marked - lets you visually verify the split
+    actually landed in the right place for this session. Both panels
+    project the *entire* 3D mask (every voxel, not one cross-section
+    through the middle), same "flatten the whole volume" idea as the maps
+    panels' single-slice projections.
+
+    With no override, uses the automatic single-threshold method
+    (_split_diaphragm_left_right) and draws it as a straight line. With
+    an override (see load_lr_split_override), uses the manually-drawn,
+    possibly-bent split line and the airway exclusion polygon instead
+    (classify_lr_with_override), airway voxels shown in gray, and draws
+    the actual drawn split line / polygon rather than a straight
+    threshold.
+    """
+    ai, aj, ak = np.where(mask)
+    vox = np.stack([ai, aj, ak, np.ones_like(ai)], axis=1).astype(float)
+    world = (affine @ vox.T).T[:, :3]
+
+    is_airway = np.zeros(len(ai), dtype=bool)
+    if override is not None:
+        is_left, is_right, is_airway = classify_lr_with_override(
+            world[:, 0], world[:, 1], world[:, 2], override, affine)
+        # The whole-volume line/polygon is only meaningful to draw when
+        # it's actually what classify_lr_with_override used - once
+        # per-slice refinements exist for a boundary, a single global
+        # line/polygon would misrepresent it (the coloring above already
+        # reflects the correct per-slice/nearest-slice result either way).
+        split_line_world = np.array(override["split_points"]) if not override.get("split_slices") else None
+        airway_line_world = (np.array(override["airway_points"])
+                              if override.get("airway_points") and not override.get("airway_slices") else None)
+        split_idx = None
+    else:
+        is_left, is_right, split_idx = _split_diaphragm_left_right(ai, mask.shape[0], affine)
+        # split_idx is a voxel index along axis 0 (L/R) - convert to its
+        # world X coordinate (affine's X row only depends on axis 0 for
+        # these axis-aligned NIfTI affines) so the split line lands at the
+        # same spot on the world-mm axes the scatter itself uses.
+        split_world_x = float(affine[0, 0] * split_idx + affine[0, 3])
+        split_line_world = None
+        airway_line_world = None
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), facecolor="black")
+    plane_hv = {"Coronal": (0, 2), "Axial": (0, 1)}
+    for ax, (plane, (h_idx, v_idx)) in zip(axes, plane_hv.items()):
+        ax.set_facecolor("black")
+        ax.scatter(world[is_left, h_idx], world[is_left, v_idx], s=3, c="#4090ff", label="left")
+        ax.scatter(world[is_right, h_idx], world[is_right, v_idx], s=3, c="#ff5040", label="right")
+        if is_airway.any():
+            ax.scatter(world[is_airway, h_idx], world[is_airway, v_idx], s=3, c="#888888", label="airway (excluded)")
+        # The split line is drawn on the axial (X/Y) plane, the airway
+        # line on the coronal (X/Z) plane - each panel shows only the
+        # line drawn on it; the other panel shows the resulting
+        # left/right/airway coloring without the line itself.
+        if plane == "Axial" and split_line_world is not None:
+            ax.plot(split_line_world[:, 0], split_line_world[:, 1], color="white",
+                     linestyle="--", linewidth=1.5, marker="o", markersize=3, label="split")
+        elif plane == "Coronal" and split_line_world is None:
+            ax.axvline(split_world_x, color="white", linestyle="--", linewidth=1.5, label="split")
+        if plane == "Coronal" and airway_line_world is not None and len(airway_line_world) >= 3:
+            poly = np.vstack([airway_line_world, airway_line_world[:1]])  # close the polygon
+            ax.plot(poly[:, 0], poly[:, 1], color="yellow",
+                     linestyle="--", linewidth=1.5, marker="o", markersize=3, label="airway polygon")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(plane, color="white", fontsize=14)
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_color("white")
+    for ax in axes:
+        ax.legend(loc="upper right", fontsize=9, facecolor="black", labelcolor="white")
+    fig.suptitle(title, color="white", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, facecolor="black")
+    plt.close(fig)
+    return split_idx
+
+
+# Phases the deformation/FRC/TLC panels already key off (R0 = EI, R7 = the
+# default registration EE) - the two phases segment_lr_step exports a
+# labeled left/right mask for.
+LR_MASK_PHASES = (0, 7)
+
+
+def segment_lr_step(main_dir, outname):
+    """
+    Applies this session's left/right lung split - the manually-drawn
+    override from the app's Left/Right Split editor if one has been saved
+    (see load_lr_split_override), otherwise the automatic mediastinal-gap
+    method (_split_diaphragm_left_right) - to the phase 0 and 7 masks, and
+    writes a labeled CT_Phase_<n>_rtk_R<n>_mLR.nii.gz next to each
+    (0=background/excluded airway, 1=left lung, 2=right lung). Returns the
+    list of paths written.
+    """
+    override = load_lr_split_override(main_dir, outname)
+    results_dir = os.path.join(main_dir, outname, "Results")
+    written = []
+    for phase in LR_MASK_PHASES:
+        mpath = os.path.join(results_dir, f"CT_Phase_{phase}_rtk_R{phase}_m.nii.gz")
+        if not os.path.isfile(mpath):
+            continue
+        img = nib.load(mpath)
+        data = np.asarray(img.dataobj)
+        affine = img.affine
+
+        label = np.zeros(data.shape, dtype=np.uint8)
+        ai, aj, ak = np.where(data > 0)
+        if len(ai) > 0:
+            if override is not None:
+                vox = np.stack([ai, aj, ak, np.ones_like(ai)], axis=1).astype(float)
+                world = (affine @ vox.T).T[:, :3]
+                is_left, is_right, _ = classify_lr_with_override(
+                    world[:, 0], world[:, 1], world[:, 2], override, affine)
+            else:
+                is_left, is_right, _ = _split_diaphragm_left_right(ai, data.shape[0], affine)
+            label[ai[is_left], aj[is_left], ak[is_left]] = 1
+            label[ai[is_right], aj[is_right], ak[is_right]] = 2
+
+        out_path = mpath[:-len(".nii.gz")] + "LR.nii.gz"
+        out_img = nib.Nifti1Image(label, affine, img.header)
+        out_img.header.set_data_dtype(np.uint8)
+        nib.save(out_img, out_path)
+        written.append(out_path)
+    return written
+
+
+def volume_analysis_step(main_dir, outname):
+    """
+    Computes this session's own FRC/TLC/TV (left/right/total, mL) at its
+    detected EI/EE phases (see compute_session_lung_volumes), and writes/
+    updates this session's row in <rat_dir>/Analysis/volume_analysis.csv,
+    where rat_dir is main_dir's parent directory - so the same CSV
+    accumulates one row per session regardless of whether sessions are
+    run one at a time (Single Dataset mode) or as part of a per-rat group
+    run, and re-running a session just replaces its own row instead of
+    duplicating it. Also saves a coronal+axial left/right split-check
+    panel (see save_lr_split_panel) next to the CSV, named per session so
+    each session's own panel doesn't overwrite another's - using the EI
+    phase's mask, since it's the larger, most complete silhouette.
+    """
+    v = compute_session_lung_volumes(main_dir, outname)
+
+    rat_dir = os.path.dirname(os.path.normpath(main_dir))
+    session_name = os.path.basename(os.path.normpath(main_dir))
+    analysis_dir = os.path.join(rat_dir, "Analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+    csv_path = os.path.join(analysis_dir, "volume_analysis.csv")
+
+    row = {
+        "session": session_name,
+        "ei_phase": v["ei_phase"], "ee_phase": v["ee_phase"],
+        "frc_left_mL": round(v["frc_left_ml"], 4), "frc_right_mL": round(v["frc_right_ml"], 4),
+        "frc_total_mL": round(v["frc_left_ml"] + v["frc_right_ml"], 4),
+        "tlc_left_mL": round(v["tlc_left_ml"], 4), "tlc_right_mL": round(v["tlc_right_ml"], 4),
+        "tlc_total_mL": round(v["tlc_left_ml"] + v["tlc_right_ml"], 4),
+        "tv_left_mL": round(v["tv_left_ml"], 4), "tv_right_mL": round(v["tv_right_ml"], 4),
+        "tv_total_mL": round(v["tv_left_ml"] + v["tv_right_ml"], 4),
+    }
+
+    existing_rows = []
+    if os.path.isfile(csv_path):
+        with open(csv_path, "r", newline="") as f:
+            existing_rows = list(csv.DictReader(f))
+    existing_rows = [r for r in existing_rows if r.get("session") != session_name]
+    existing_rows.append(row)
+    existing_rows.sort(key=lambda r: r["session"])  # session folders are named YYYY-MM-DD_HHhMM
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=VOLUME_ANALYSIS_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(existing_rows)
+    print(f"Volume analysis updated: {csv_path} (session {session_name}: EI=R{v['ei_phase']} EE=R{v['ee_phase']})")
+    log_artifact(csv_path)
+
+    masks = np.load(os.path.join(main_dir, outname, "Results", "mask.npy"))
+    affine = np.load(os.path.join(main_dir, outname, "Results", "affine.npy"))
+    override = load_lr_split_override(main_dir, outname)
+    split_panel_path = os.path.join(analysis_dir, f"{session_name}_lr_split.jpg")
+    save_lr_split_panel(masks[v["ei_phase"]].astype(bool), affine, split_panel_path,
+                         title=f"{session_name} - left/right split (R{v['ei_phase']}, EI)",
+                         override=override)
+    log_artifact(split_panel_path)
+
+    return csv_path
+
+
+def register_phase0_to_baseline(baseline_dir, moving_dir, outname, antspath=None, force=False):
+    """
+    Registers phase 0 of moving_dir onto phase 0 of baseline_dir - a
+    DIFFERENT SESSION of the same rat (not a phase within one session,
+    which is what register_step/register_all_phases do) - and also warps
+    baseline_dir's phase-0 mask onto moving_dir's original grid, for
+    visual comparison against the raw moving scan. Ported from
+    Desktop/Pipeline/"register to baseline.ipynb", adapted to this app's
+    fixed `outname` and CT_Phase_0_rtk_R0(_m).nii.gz naming instead of
+    that notebook's generic "*_R0.nii.gz" glob.
+
+    yi2.sh needs both images in one folder, and every session here reuses
+    the same "CT_Phase_0_rtk_R0" filename, so phase-0 image+mask from
+    each session are staged into a scratch folder under distinct,
+    traceable names (the session's own date/time folder name) before
+    calling it.
+
+    moving_dir's R0 is the one that gets warped ("fixname" in yi2.sh
+    terms); baseline_dir's R0 stays fixed and defines the output grid
+    ("movname").
+
+    Returns the output directory (as a string) containing the warp,
+    Jacobian, warped image, and the baseline mask warped onto moving's
+    grid.
+    """
+    antspath = Path(antspath) if antspath else DEFAULT_ANTSPATH
+    baseline_dir, moving_dir = Path(baseline_dir), Path(moving_dir)
+    baseline_label, moving_label = baseline_dir.name, moving_dir.name
+
+    baseline_results = baseline_dir / outname / "Results"
+    moving_results = moving_dir / outname / "Results"
+    baseline_img, baseline_mask = baseline_results / "CT_Phase_0_rtk_R0.nii.gz", baseline_results / "CT_Phase_0_rtk_R0_m.nii.gz"
+    moving_img, moving_mask = moving_results / "CT_Phase_0_rtk_R0.nii.gz", moving_results / "CT_Phase_0_rtk_R0_m.nii.gz"
+    for p in (baseline_img, baseline_mask, moving_img, moving_mask):
+        if not p.is_file():
+            raise FileNotFoundError(f"{p} not found - run Segment on this session first.")
+
+    output_dir = moving_results / "Registered_to_Baseline" / f"R0_to_{baseline_label}"
+    staging_dir = output_dir / "inputs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    fixname = f"{moving_label}_R0"    # gets warped
+    movname = f"{baseline_label}_R0"  # stays fixed, defines output grid
+
+    def stage(src, dst):
+        if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+            return
+        shutil.copy2(src, dst)
+
+    stage(moving_img, staging_dir / f"{fixname}.nii.gz")
+    stage(moving_mask, staging_dir / f"{fixname}_m.nii.gz")
+    stage(baseline_img, staging_dir / f"{movname}.nii.gz")
+    stage(baseline_mask, staging_dir / f"{movname}_m.nii.gz")
+
+    if " " in str(staging_dir) or " " in str(antspath):
+        raise ValueError("yi2.sh does not quote its paths internally, so these paths must not contain spaces.")
+
+    warped_path = output_dir / f"{fixname}_To_{movname}_Warped.nii.gz"
+    forward_warp = output_dir / f"{fixname}_To_{movname}_TotalWarp_Forward.nii.gz"
+    baseline_mask_on_moving_grid = output_dir / f"{movname}_m_To_{fixname}_grid.nii.gz"
+
+    if warped_path.is_file() and not force:
+        print(f"Already registered, skipping ({warped_path.name} exists). Pass force=True to re-run.")
+    else:
+        if not (antspath / "antsRegistration.exe").is_file():
+            raise FileNotFoundError(f"antsRegistration.exe not found under antspath: {antspath}")
+        bash_exe = find_bash()
+        print(f"Registering {fixname} (moving) -> {movname} (baseline)")
+        ok = run_registration(bash_exe, antspath, fixname, movname, staging_dir, output_dir)
+        if not ok:
+            raise RuntimeError(f"Registration failed: {fixname} -> {movname}")
+        print(f"Done. Warped image: {warped_path}")
+
+    if baseline_mask_on_moving_grid.is_file() and not force:
+        print(f"Baseline mask already warped onto moving grid, skipping ({baseline_mask_on_moving_grid.name} exists).")
+    else:
+        if not forward_warp.is_file():
+            raise FileNotFoundError(
+                f"Expected forward warp field not found (yi2.sh should have produced it): {forward_warp}")
+        print(f"Warping baseline mask ({movname}_m) onto moving's original grid ({fixname})")
+        cmd = [
+            str(antspath / "antsApplyTransforms.exe"), "-d", "3",
+            "-r", str(staging_dir / f"{fixname}.nii.gz"),
+            "-i", str(staging_dir / f"{movname}_m.nii.gz"),
+            "-t", str(forward_warp),
+            "-n", "NearestNeighbor",
+            "-o", str(baseline_mask_on_moving_grid),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"antsApplyTransforms failed (baseline mask onto moving grid):\n{result.stdout}\n{result.stderr}")
+        print(f"Done. Baseline mask on moving grid: {baseline_mask_on_moving_grid}")
+
+    return str(output_dir)
+
+
+def register_baseline_for_rat(rat_dir, outname, sessions=None, antspath=None, force=False):
+    """
+    Runs register_phase0_to_baseline for every session of a rat except the
+    first (chronologically) - the rat's own earliest session is the
+    baseline, matching "register to baseline.ipynb"'s driver loop. Used by
+    run_group's "register_to_baseline" step, which is per-RAT rather than
+    per-session (it needs the whole rat's session list up front to know
+    which one is the baseline), unlike every other step. `sessions`, if
+    given, skips re-discovering them (run_group already has the list).
+    Returns the list of output directories produced (one per moving
+    session actually registered).
+    """
+    sessions = sessions if sessions is not None else get_rat_session_dirs(rat_dir)
+    if len(sessions) < 2:
+        print(f"Only {len(sessions)} session(s) found for {rat_dir} - need at least 2 to register to a baseline.")
+        return []
+    baseline_dir = sessions[0]
+    print(f"Baseline: {baseline_dir}")
+    out_dirs = []
+    for moving_dir in sessions[1:]:
+        print(f"Registering: {moving_dir}")
+        out_dirs.append(register_phase0_to_baseline(
+            baseline_dir, moving_dir, outname, antspath=antspath, force=force))
+    return out_dirs
 
 
 def run_group(rat_dirs, steps, threshold=0.5):
@@ -1381,6 +2754,21 @@ def run_group(rat_dirs, steps, threshold=0.5):
             else:
                 overall_rc = 1
                 print(f"===SESSION_FAILED=== {session_dir}: step(s) failed, see log above", flush=True)
+
+        if "register_to_baseline" in steps:
+            # Per-RAT, not per-session (unlike every other step) - it needs
+            # this rat's whole session list up front to know which one is
+            # the baseline, so it runs once here after that rat's sessions
+            # have all gone through Segment above, rather than inside
+            # run()'s per-session dispatch.
+            log_step("register_to_baseline")
+            try:
+                for d in register_baseline_for_rat(rat_dir, outname, sessions=sessions):
+                    log_artifact(d)
+                log_done("register_to_baseline")
+            except Exception as e:
+                overall_rc = 1
+                log_failed("register_to_baseline", e)
 
     print(f"\n===GROUP_ALL_DONE=== {done}/{total_sessions} sessions processed", flush=True)
     return overall_rc

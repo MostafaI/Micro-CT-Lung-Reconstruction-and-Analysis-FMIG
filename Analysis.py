@@ -214,16 +214,36 @@ def get_files_expensive(raw_dir, raw=False, mask=False, jacobian=False,warped=Fa
     im_stack = np.array(im_stack)
     return im_stack,files, affine, header
 
+def _is_valid_cached_npy(path):
+    # A segmentation attempt that fails before any per-phase mask/raw files
+    # exist yet (e.g. extract_ct_mask errors out on every file) can still
+    # reach this point with an empty file list, producing a 0-size
+    # placeholder .npy. Checking only os.path.isfile() - the original guard
+    # here - treats that stale empty file as "already computed" and skips
+    # ever rebuilding it, even after a later run successfully creates the
+    # real per-phase files (confirmed on real data: a dataset stuck with a
+    # permanent empty mask.npy this way, crashing every downstream step
+    # that assumed a real 4D mask array). mmap_mode avoids loading a large
+    # valid array fully into memory just to check it isn't empty.
+    if not os.path.isfile(path):
+        return False
+    try:
+        arr = np.load(path, mmap_mode='r')
+        return arr.size > 0
+    except Exception:
+        return False
+
+
 def save_npy(raw_dir, run_mask=True, run_raw=True, run_registered = True, run_jacobian=True, floats=False):
     #---mask
-    if not os.path.isfile(raw_dir + '/mask.npy') and run_mask:
-        mask, mask_names,affine,header = get_files_expensive(raw_dir, mask=1)          
+    if not _is_valid_cached_npy(raw_dir + '/mask.npy') and run_mask:
+        mask, mask_names,affine,header = get_files_expensive(raw_dir, mask=1)
         np.save(raw_dir + '/mask.npy', mask.astype(np.uint8))
         np.save(raw_dir + '/mask_names.npy', mask_names)
         np.save(raw_dir + '/affine.npy', affine)
         np.save(raw_dir + '/header.npy', header)
     #---raw
-    if not os.path.isfile(raw_dir + '/raw.npy') and run_raw:
+    if not _is_valid_cached_npy(raw_dir + '/raw.npy') and run_raw:
         raw_im_stack, raw_names,affine,header = get_files_expensive(raw_dir, raw=1)
         np.save(raw_dir + '/raw.npy', raw_im_stack.astype(np.int16))
         if floats: np.save(raw_dir + '/raw.npy', raw_im_stack.astype(np.float32))
