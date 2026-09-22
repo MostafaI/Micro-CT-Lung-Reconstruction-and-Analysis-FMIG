@@ -26,31 +26,54 @@ from scipy.signal import find_peaks_cwt
 from concurrent.futures import ThreadPoolExecutor
 
 
-def check_timing(main_dir):
+class DegenerateTimingError(Exception):
+    """Raised by check_timing when the scanner's own per-projection
+    timestamps are degenerate (e.g. every row logged as the -99999 sentinel)
+    and use_fallback wasn't explicitly set - a real hardware/logging fault,
+    not something to silently paper over. Callers (pipeline_driver.run())
+    should surface this to the user and only retry with use_fallback=True
+    once they've explicitly agreed to substitute the known-timing template."""
+    pass
+
+
+def check_timing(main_dir, use_fallback=False):
+    """Returns True if the fallback timing template was actually substituted
+    in for this session, False if this session's own timestamps were fine
+    (or too malformed to even check) - callers use this to decide whether
+    this specific session's output belongs in the normal or "_fallback"
+    output folder, so a batch run doesn't mislabel sessions that never
+    needed the fallback in the first place."""
     logpath = os.path.join(main_dir,'ct-data', 'proj_000_0_log.csv')
-    # check timing 
+    # check timing
     file = open(logpath); lines= file.readlines() ; file.close()
     alist = []
     for line in lines: alist.append(np.array(line.rstrip().split(',')).astype(np.float64))
     lines = np.array(alist)
-    if lines.shape[1] < 4: 
+    if lines.shape[1] < 4:
         print("\t\tProblem with timeStamps in the proj_log.csv file")
-        return
-    
+        return False
+
     timing = lines[:, 3]
     if len(np.unique(timing)) > 10:
         print('All good!')
-        return
-    
-    # Fix Timing 
+        return False
+
+    if not use_fallback:
+        raise DegenerateTimingError(
+            f"{logpath} has degenerate per-projection timestamps "
+            f"({len(np.unique(timing))} unique value(s) across {len(timing)} rows) - "
+            "the scanner failed to log real timing for this acquisition."
+        )
+
+    # Fix Timing
     times = np.load('./sample_times_32p_55kv_37ma_20ms.npy')
     lines[:,3] = times
     os.rename(logpath, logpath.replace('.csv','_original.csv'))
     proj_file_new = open(logpath, 'w')
     for line in lines: proj_file_new.write(','.join(line.astype(str)) + '\n')
-    proj_file_new.close() 
+    proj_file_new.close()
     print('Created a new timing from save time samples')
-    return
+    return True
 
 def get_signal_from_image(folder, array=[], xlimits=[300, 500],
                           ylimits=[0, -1], subtract_baseline=False, spring=False, bm3d=False,

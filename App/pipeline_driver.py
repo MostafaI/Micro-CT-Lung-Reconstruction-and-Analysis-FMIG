@@ -187,9 +187,15 @@ def clean_study_folder(session):
             pt = True
     print()
             
-def MI_reconstruction(main_dir, threshold=0.5):
+def MI_reconstruction(main_dir, threshold=0.5, use_fallback_timing=False):
+    global outname
     corr_dir = os.path.join(main_dir, 'ct-data', 'corr')
-    check_timing(main_dir)
+    # outname is decided per-session, from whether THIS session's own
+    # timing actually needed the fallback - not just from the flag being
+    # allowed - so a batch run over several sessions doesn't mislabel the
+    # ones that never needed it (see resolve_outname/run()'s docstring).
+    fallback_used = check_timing(main_dir, use_fallback=use_fallback_timing)
+    outname = FALLBACK_OUTNAME if fallback_used else BASE_OUTNAME
     step_2(main_dir)
     xlimits = step_3(main_dir, corr_dir, threshold=threshold)
     s, t, a = step_4(main_dir, xlimits, threshold)
@@ -708,16 +714,19 @@ def get_ei_on_ee_grid(main_dir, outname, PHASE=7, overwrite=False, antspath=None
     )
 
 
-def _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir, num_slices=6, dpi=300):
+def _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir, num_slices=6, dpi=300, affine=None):
     """
     Same TV/FV/J math as Analysis.save_maps_registrations_core, just fed a
     single already-registered (ei, ee, jacobian) triple instead of indexing
     into a 16-phase stack - see _locate_analysis_maps_files for where these
-    come from in this pipeline.
+    come from in this pipeline. Also saves DeltaBlood.png/_smoothed.png (see
+    get_maps_single_slice_panel_ei's DeltaBlood_3d for the same formula) when
+    an affine is supplied to convert voxel volume to nL.
     """
     TV_path = os.path.join(maps_dir, 'TV.png')
     FV_path = os.path.join(maps_dir, 'FV.png')
     J_path = os.path.join(maps_dir, 'J.png')
+    DeltaBlood_path = os.path.join(maps_dir, 'delta_blood.png')
 
     fx = mask.any(axis=(1, 2))
     fy = mask.any(axis=(0, 2))
@@ -734,6 +743,11 @@ def _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir, num_slice
     ei_masked = _crop(ei_img)
     J_masked = _crop(jac)
 
+    voxel_vol_nL = None
+    if affine is not None:
+        zooms = np.abs(np.diag(affine))[:3]
+        voxel_vol_nL = float(zooms[0] * zooms[1] * zooms[2]) * 1000.0  # mm^3 -> nL
+
     for smooth in (False, True):
         ee_slices = get_x_slices_from_image(ee_masked, number_of_slices=num_slices,
                                              coronal_axis=1, transpose=False, airways=False, smooth=smooth)
@@ -743,15 +757,25 @@ def _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir, num_slice
                                             coronal_axis=1, transpose=False, airways=False, smooth=smooth)
         FV = 1 - np.divide(ee_slices * J_slices, ei_slices, where=ei_slices != 0)
         J = 1 - J_slices
-        TV = ei_slices / -1000 - ee_slices / -1000
+        # Jacobian-corrected TV (CT_Ventilation_Equations.pdf Convention B,
+        # EI-domain: TV = (j*HU_EE - HU_EI)/1000, j = J_slices here) - matches
+        # the same j-correction FV already applies to its ee_slices term.
+        TV = (J_slices * ee_slices - ei_slices) / 1000
         if smooth:
             save_image_MI_style(FV, 0, 1, FV_path.replace(".png", "_smoothed.png"), dpi)
             save_image_MI_style(J, 0, 1, J_path.replace(".png", "_smoothed.png"), dpi)
-            save_image_MI_style(TV, 0, 0.5, TV_path.replace(".png", "_smoothed.png"), dpi)
+            save_image_MI_style(TV, -0.1, 0.6, TV_path.replace(".png", "_smoothed.png"), dpi)
         else:
             save_image_MI_style(FV, 0, 1, FV_path, dpi)
             save_image_MI_style(J, 0, 1, J_path, dpi)
-            save_image_MI_style(TV, 0, 0.5, TV_path, dpi)
+            save_image_MI_style(TV, -0.1, 0.6, TV_path, dpi)
+
+        if voxel_vol_nL is not None:
+            # CT_Ventilation_Equations.pdf Convention B (EI-domain): Delta
+            # denotes EI minus EE - (HU_EI+1000) - j*(HU_EE+1000).
+            DeltaBlood = (voxel_vol_nL / 1000.0) * ((ei_slices + 1000) - J_slices * (ee_slices + 1000))
+            out_path = DeltaBlood_path.replace(".png", "_smoothed.png") if smooth else DeltaBlood_path
+            save_image_MI_style(DeltaBlood, -1.5, 1.5, out_path, dpi, cmap="coolwarm")
 
 
 def get_maps_r7_r0(main_dir, outname, PHASE=7, overwrite=False):
@@ -768,21 +792,23 @@ def get_maps_r7_r0(main_dir, outname, PHASE=7, overwrite=False):
     TV_path = os.path.join(maps_dir, 'TV.png')
     FV_path = os.path.join(maps_dir, 'FV.png')
     J_path = os.path.join(maps_dir, 'J.png')
-    if not overwrite and all(os.path.isfile(p) for p in (TV_path, FV_path, J_path)):
+    DeltaBlood_path = os.path.join(maps_dir, 'delta_blood.png')
+    if not overwrite and all(os.path.isfile(p) for p in (TV_path, FV_path, J_path, DeltaBlood_path)):
         return
 
     files = _locate_analysis_maps_files(main_dir, outname, PHASE=PHASE)
 
+    fixed_mask_nii = nib.load(files["fixed_mask_path"])
     ei_img = nib.load(files["fixed_image_path"]).get_fdata()
     ee_img = nib.load(files["warped_path"]).get_fdata()
     jac = nib.load(files["jacobian_path"]).get_fdata()
-    mask = nib.load(files["fixed_mask_path"]).get_fdata().astype(bool)
+    mask = fixed_mask_nii.get_fdata().astype(bool)
 
     ei_img = gaussian_filter(ei_img, 1)
     ee_img = gaussian_filter(ee_img, 1)
     jac = gaussian_filter(jac, 1)
 
-    _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir)
+    _save_analysis_maps_from_pair(ei_img, ee_img, jac, mask, maps_dir, affine=fixed_mask_nii.affine)
     save_combined_maps_figure(maps_dir)
 
 
@@ -900,6 +926,18 @@ def _render_deformation_panel(ax, warp, mask, affine, plane, vmin=0.0, vmax=5.0)
     return q
 
 
+# One colormap per functional map, so each is visually distinct at a
+# glance instead of every quantity sharing the same jet scale.
+MAP_COLORMAPS = {
+    "HU": "gray",  # raw CT signal, not a derived functional quantity - grayscale like any CT viewer
+    "FRC": "rainbow",
+    "TLC": "plasma",
+    "TV": "viridis",
+    "FV": "hot",
+    "J": "magma",
+}
+
+
 def _render_maps_panel(panels, out_path, title, plane="coronal"):
     n = len(panels)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), dpi=200, facecolor="black")
@@ -909,7 +947,7 @@ def _render_maps_panel(panels, out_path, title, plane="coronal"):
             warp, mask, affine = arr
             im = _render_deformation_panel(ax, warp, mask, affine, plane, vmin=vmin, vmax=vmax)
         else:
-            im = ax.imshow(arr.T, origin="lower", cmap="jet", vmin=vmin, vmax=vmax)
+            im = ax.imshow(arr.T, origin="lower", cmap=MAP_COLORMAPS.get(name, "jet"), vmin=vmin, vmax=vmax)
             ax.axis("off")
         ax.set_title(name, color="white", fontsize=18)
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -941,14 +979,24 @@ def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", 
         return out_path
 
     files = _locate_analysis_maps_files(main_dir, outname, PHASE=PHASE)
-    ei_mask = nib.load(files["fixed_mask_path"]).get_fdata().astype(bool)
+    ei_mask_nii = nib.load(files["fixed_mask_path"])
+    ei_mask = ei_mask_nii.get_fdata().astype(bool)
     ei_own_img = gaussian_filter(nib.load(files["fixed_image_path"]).get_fdata(), 1)
     ee_on_ei_img = gaussian_filter(nib.load(files["warped_path"]).get_fdata(), 1)
     jac_on_ei = gaussian_filter(nib.load(files["jacobian_path"]).get_fdata(), 1)  # native EI->EE, <1
 
     panels = [
-        ("FRC", _masked_axis_projection(ee_on_ei_img / -1000, ei_mask, axis=axis), 0, 1),
-        ("TLC", _masked_axis_projection(ei_own_img / -1000, ei_mask, axis=axis), 0, 1),
+        # Raw HU signal (this grid's own native image, unconverted) - just
+        # the anatomical CT slice for reference, gray like any CT viewer.
+        # Range calibrated to real percentiles on a real session (lung
+        # tissue here runs about -990 to +120 HU at the 0.5-99.5th pctile).
+        ("HU", _masked_axis_projection(ei_own_img, ei_mask, axis=axis), -1000, 200),
+        # vmin/vmax below are calibrated to where this data actually lives
+        # (checked via real percentiles on a real session), not just each
+        # map's theoretical 0-1 bound - stretching the colormap over range
+        # the data never reaches makes the whole panel look nearly flat.
+        ("FRC", _masked_axis_projection(ee_on_ei_img / -1000, ei_mask, axis=axis), 0, 0.8),
+        ("TLC", _masked_axis_projection(ei_own_img / -1000, ei_mask, axis=axis), 0, 0.9),
     ]
 
     # TV/FV/J computed voxel-wise in 3D first, THEN collapsed to 2D by
@@ -962,17 +1010,24 @@ def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", 
         FV_3d = 1 - np.divide(ee_masked * jac_masked, ei_masked, where=ei_masked != 0)
     FV_3d = np.clip(FV_3d, 0.0, 1.0)  # see the EE panel's comment - a handful of near-zero-denominator voxels can otherwise wreck a whole averaged column
     J_map_3d = 1 - jac_masked
-    TV_3d = ei_masked / -1000 - ee_masked / -1000
+    # Jacobian-corrected TV (CT_Ventilation_Equations.pdf Convention B,
+    # EI-domain: TV = (j*HU_EE - HU_EI)/1000, j = jac_masked here) - matches
+    # the same j-correction FV_3d already applies to its ee_masked term.
+    TV_3d = (jac_masked * ee_masked - ei_masked) / 1000
 
     with np.errstate(invalid="ignore"):
-        panels.append(("TV", np.nanmean(TV_3d, axis=axis), 0, 0.5))
-        panels.append(("FV", np.nanmean(FV_3d, axis=axis), 0, 1))
-        panels.append(("J", np.nanmean(J_map_3d, axis=axis), 0, 1))
+        # Range widened/re-centered after adding the Jacobian correction
+        # (checked via real percentiles): TV can now legitimately dip
+        # slightly negative (matches the document's note that regional TV
+        # can be negative), and its upper tail runs further than the old
+        # uncorrected 0-0.25.
+        panels.append(("TV", np.nanmean(TV_3d, axis=axis), -0.1, 0.6))
+        panels.append(("FV", np.nanmean(FV_3d, axis=axis), 0, 0.7))
+        panels.append(("J", np.nanmean(J_map_3d, axis=axis), 0, 0.3))
 
     # Whole-lung displacement arrows, on EI's own grid: TotalWarp.nii.gz
     # points EI->EE (see _locate_analysis_maps_files), the EI-grid analogue
     # of the Forward.nii.gz field the EE panel uses.
-    ei_mask_nii = nib.load(files["fixed_mask_path"])
     total_warp = np.asarray(nib.load(files["total_warp_path"]).dataobj).squeeze()
     panels.append(("Deformation", (total_warp, ei_mask, ei_mask_nii.affine), 0.0, 5.0))
 
@@ -1020,15 +1075,26 @@ def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", 
     sizes = masks.sum(axis=(1, 2, 3))
     ee_index = int(np.argmin(sizes))
 
-    panels = [("FRC", _masked_axis_projection(gaussian_filter(imgs[ee_index], 1) / -1000, masks[ee_index], axis=axis), 0, 1)]
+    # vmin/vmax below are calibrated to where this data actually lives
+    # (checked via real percentiles on a real session), not just each
+    # map's theoretical 0-1 bound - stretching the colormap over range the
+    # data never reaches makes the whole panel look nearly flat.
+    ee_native_img = gaussian_filter(imgs[ee_index].astype(np.float32), 1)
+    panels = [
+        # Raw HU signal (this grid's own native image, unconverted) - see
+        # the EI panel's HU comment for the range calibration.
+        ("HU", _masked_axis_projection(ee_native_img, masks[ee_index], axis=axis), -1000, 200),
+        ("FRC", _masked_axis_projection(ee_native_img / -1000, masks[ee_index], axis=axis), 0, 0.8),
+    ]
 
     ee_grid_files = get_ei_on_ee_grid(main_dir, outname, PHASE=PHASE, overwrite=False)
-    ee_mask = nib.load(ee_grid_files["ee_mask_path"]).get_fdata().astype(bool)
+    ee_mask_nii = nib.load(ee_grid_files["ee_mask_path"])
+    ee_mask = ee_mask_nii.get_fdata().astype(bool)
     ei_on_ee_img = gaussian_filter(nib.load(ee_grid_files["ei_on_ee_path"]).get_fdata(), 1)
     ee_own_img = gaussian_filter(nib.load(ee_grid_files["ee_reference_path"]).get_fdata(), 1)
     jac_on_ee = gaussian_filter(nib.load(ee_grid_files["jac_on_ee_path"]).get_fdata(), 1)  # native EE->EI, >1
 
-    panels.append(("TLC", _masked_axis_projection(ei_on_ee_img / -1000, ee_mask, axis=axis), 0, 1))
+    panels.append(("TLC", _masked_axis_projection(ei_on_ee_img / -1000, ee_mask, axis=axis), 0, 0.9))
 
     ei_masked = _mask_bbox_crop(ei_on_ee_img, ee_mask)
     ee_masked = _mask_bbox_crop(ee_own_img, ee_mask)
@@ -1047,21 +1113,26 @@ def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", 
     # J shows the native expansion jacobian directly, unmodified - it's
     # generally >1, so no clipping to a 0-1 range like the other maps.
     J_map_3d = jac_masked
-    TV_3d = ei_masked / -1000 - ee_masked / -1000
+    # Jacobian-corrected TV (CT_Ventilation_Equations.pdf Convention A,
+    # EE-domain: TV = (HU_EE - J*HU_EI)/1000, J = jac_masked here) - matches
+    # the same J-correction FV_3d already applies to its ei_masked term.
+    TV_3d = (ee_masked - jac_masked * ei_masked) / 1000
 
     with np.errstate(invalid="ignore"):
-        panels.append(("TV", np.nanmean(TV_3d, axis=axis), 0, 0.5))
-        panels.append(("FV", np.nanmean(FV_3d, axis=axis), 0, 1))
-        # Fixed 1-2 scale (not a per-session dynamic max) so J stays
-        # comparable across sessions/rats, same as every other map here
-        # using a fixed vmin/vmax - real data on this dataset ranged about
-        # 1.0-1.8, so 2.0 leaves headroom without washing out the detail.
-        panels.append(("J", np.nanmean(J_map_3d, axis=axis), 1.0, 2.0))
+        # Range widened/re-centered after adding the Jacobian correction -
+        # see the EI panel's identical comment.
+        panels.append(("TV", np.nanmean(TV_3d, axis=axis), -0.1, 0.6))
+        panels.append(("FV", np.nanmean(FV_3d, axis=axis), 0, 0.7))
+        # Fixed scale (not a per-session dynamic max) so J stays comparable
+        # across sessions/rats, same as every other map here using a fixed
+        # vmin/vmax - real data on this dataset ranged about 0.94-1.41, so
+        # 1.0-1.45 uses most of the colorbar instead of the 1.0-2.0 range
+        # this used to have, where real data never got past the bottom 41%.
+        panels.append(("J", np.nanmean(J_map_3d, axis=axis), 1.0, 1.45))
 
     # Whole-lung displacement arrows, on EE's own grid: Forward.nii.gz
     # points EE->EI (see _locate_diaphragm_warp_and_mask), the same field
     # the diaphragm step's whole-lung arrows already use.
-    ee_mask_nii = nib.load(ee_grid_files["ee_mask_path"])
     forward_warp_path, _, _, _ = _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE)
     forward_warp = np.asarray(nib.load(forward_warp_path).dataobj).squeeze()
     panels.append(("Deformation", (forward_warp, ee_mask, ee_mask_nii.affine), 0.0, 5.0))
@@ -2169,25 +2240,61 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
                 panel_out=panel_out, panel_out_diaphragm=panel_out_diaphragm, txt_out=txt_out)
 
 
-outname = 'Optimized_Reconstruction-MI'
+BASE_OUTNAME = 'Optimized_Reconstruction-MI'
+FALLBACK_OUTNAME = BASE_OUTNAME + '_fallback'
+outname = BASE_OUTNAME  # current effective output-folder name for this process - see resolve_outname()
 # --------------------------------------------------------------------------
 # End of code copied from the notebook.
 # --------------------------------------------------------------------------
 
 
-def run(main_dir, steps, threshold=0.5, announce_done=True):
+def resolve_outname(main_dir):
+    """Which output-folder name this main_dir's steps should read/write,
+    for a run that doesn't include "recon" (e.g. re-running just
+    Segment/Analysis later on a session that used the fallback timing
+    template) - auto-detect which folder actually exists on disk,
+    preferring the primary name. Matches the user's ask that "all the
+    analysis should look for our output folder, if it doesn't exist then
+    look for the _fallback folder". When "recon" IS in this run's steps,
+    MI_reconstruction decides outname itself instead, per-session, from
+    whether that session's own timing actually needed the fallback."""
+    if os.path.isdir(os.path.join(main_dir, BASE_OUTNAME)):
+        return BASE_OUTNAME
+    if os.path.isdir(os.path.join(main_dir, FALLBACK_OUTNAME)):
+        return FALLBACK_OUTNAME
+    return BASE_OUTNAME
+
+
+def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=False):
     """announce_done=False suppresses the trailing "===ALL_DONE===" marker -
     used by run_group(), which calls this once per session, so the GUI
     doesn't mistake one session finishing for the whole group being done
     (run_group prints its own "===GROUP_ALL_DONE===" once every session in
     the group has actually run)."""
+    global outname
+    if "recon" not in steps:
+        # No recon in this invocation, so nothing will call MI_reconstruction
+        # to (re-)decide outname - resolve it from what's already on disk.
+        outname = resolve_outname(main_dir)
+        if outname != BASE_OUTNAME:
+            print(f"Using fallback output folder: {outname}", flush=True)
+
     if "recon" in steps:
         log_step("recon")
         try:
-            MI_reconstruction(main_dir, threshold=threshold)
+            MI_reconstruction(main_dir, threshold=threshold, use_fallback_timing=use_fallback_timing)
+        except DegenerateTimingError as e:
+            # Distinct marker (not just ===STEP_FAILED===) so the GUI can
+            # recognize this specific case and offer to retry with the
+            # fallback timing template instead of just reporting a failure.
+            print(f"===TIMING_FALLBACK_NEEDED=== {e}", flush=True)
+            log_failed("recon", e)
+            return 1
         except Exception as e:
             log_failed("recon", e)
             return 1
+        if outname != BASE_OUTNAME:
+            print(f"Using fallback output folder: {outname}", flush=True)
         log_done("recon")
 
     if "segment" in steps:
@@ -2712,7 +2819,7 @@ def register_baseline_for_rat(rat_dir, outname, sessions=None, antspath=None, fo
     return out_dirs
 
 
-def run_group(rat_dirs, steps, threshold=0.5):
+def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False):
     """
     Runs `steps` (the same set run() runs for one dataset) across every
     session found under each rat directory in `rat_dirs` - one rat at a
@@ -2744,7 +2851,8 @@ def run_group(rat_dirs, steps, threshold=0.5):
             done += 1
             print(f"\n===SESSION=== {session_dir} ({done}/{total_sessions})", flush=True)
             try:
-                rc = run(session_dir, steps, threshold=threshold, announce_done=False)
+                rc = run(session_dir, steps, threshold=threshold, announce_done=False,
+                         use_fallback_timing=use_fallback_timing)
             except Exception as e:
                 print(f"===SESSION_FAILED=== {session_dir}: {e}", flush=True)
                 traceback.print_exc()
@@ -2763,7 +2871,12 @@ def run_group(rat_dirs, steps, threshold=0.5):
             # run()'s per-session dispatch.
             log_step("register_to_baseline")
             try:
-                for d in register_baseline_for_rat(rat_dir, outname, sessions=sessions):
+                # Resolve explicitly from the baseline session's own folder,
+                # rather than trusting the module-level outname - by this
+                # point it holds whatever the last session processed above
+                # left it as, which needn't match this rat's baseline.
+                baseline_outname = resolve_outname(sessions[0]) if sessions else outname
+                for d in register_baseline_for_rat(rat_dir, baseline_outname, sessions=sessions):
                     log_artifact(d)
                 log_done("register_to_baseline")
             except Exception as e:
@@ -2789,6 +2902,13 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5,
                          help="Projection segmentation threshold in (0, 1] used when "
                               "extracting the breathing signal for gated recon. Default 0.5.")
+    parser.add_argument("--use-fallback-timing", action="store_true",
+                         help="Permission to substitute the known-good timing template when a "
+                              "session's own per-projection timestamps are degenerate, instead of "
+                              "failing with DegenerateTimingError. Output for any session that "
+                              "actually needed this goes to '<outname>_fallback' instead of "
+                              "'<outname>'. Only pass this after the user has explicitly confirmed "
+                              "it (the GUI shows a prompt when recon hits this).")
     args = parser.parse_args()
 
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
@@ -2814,7 +2934,7 @@ def main():
         print(f"rats = {args.rats}")
         print(f"steps = {steps}")
         print(f"threshold = {threshold}")
-        return run_group(args.rats, steps, threshold=threshold)
+        return run_group(args.rats, steps, threshold=threshold, use_fallback_timing=args.use_fallback_timing)
 
     if not args.main_dir:
         print("Either main_dir or --rats is required.", file=sys.stderr)
@@ -2827,7 +2947,7 @@ def main():
     print(f"main_dir = {main_dir}")
     print(f"steps = {steps}")
     print(f"threshold = {threshold}")
-    return run(main_dir, steps, threshold=threshold)
+    return run(main_dir, steps, threshold=threshold, use_fallback_timing=args.use_fallback_timing)
 
 
 if __name__ == "__main__":

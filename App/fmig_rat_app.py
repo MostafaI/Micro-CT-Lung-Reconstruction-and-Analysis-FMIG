@@ -618,6 +618,8 @@ class App(tk.Tk):
         self.last_artifacts = {}
         self._auto_start_attempted = False
         self._pending_lr_editor_dir = None
+        self._last_cmd = None
+        self._pending_timing_fallback_msg = None
 
         # Group Analysis mode: run the same steps across every session found
         # under one or more rat directories (see pipeline_driver.get_rat_session_dirs
@@ -875,7 +877,12 @@ class App(tk.Tk):
                 self.step_labels["segment_lr"].config(text="FAILED", foreground="#c00")
             return
 
-        LRSplitEditor(self, main_dir, deps["pd"].outname, deps, on_close=self._on_lr_editor_closed)
+        # This editor runs in-process, in a separate Python interpreter from
+        # the subprocess pipeline that may have resolved outname to the
+        # "_fallback" folder for this session - re-resolve it here the same
+        # way instead of trusting this process's own (always-default) pd.outname.
+        editor_outname = deps["pd"].resolve_outname(main_dir)
+        LRSplitEditor(self, main_dir, editor_outname, deps, on_close=self._on_lr_editor_closed)
 
     def _on_lr_editor_closed(self, saved):
         if "segment_lr" not in self.step_labels:
@@ -1131,6 +1138,8 @@ class App(tk.Tk):
     def _launch_process(self, cmd, active_labels, steps):
         self._active_step_labels = active_labels
         self._active_steps = steps
+        self._last_cmd = cmd
+        self._pending_timing_fallback_msg = None
         for key, _ in ALL_STEPS:
             if key in active_labels:
                 active_labels[key].config(text="", foreground="gray")
@@ -1235,6 +1244,11 @@ class App(tk.Tk):
         elif line.startswith("===ARTIFACT=== "):
             path = line.split("===ARTIFACT=== ", 1)[1].strip()
             self._add_artifact(path)
+        elif line.startswith("===TIMING_FALLBACK_NEEDED=== "):
+            # Recon hit a session with degenerate CT-scanner timestamps and
+            # refused to silently substitute the fallback template - ask the
+            # user in _handle_exit, once the (failed) run has fully stopped.
+            self._pending_timing_fallback_msg = line.split("===TIMING_FALLBACK_NEEDED=== ", 1)[1].strip()
         elif line.startswith("===SESSION=== "):
             # Group mode: a new session is starting - reset this run's step
             # labels back to "queued" so a status left over from the
@@ -1270,6 +1284,22 @@ class App(tk.Tk):
                 self._start_lr_editor_for_run(pending_dir)
             elif "segment_lr" in self.step_labels:
                 self.step_labels["segment_lr"].config(text="skipped", foreground="gray")
+
+        timing_msg = self._pending_timing_fallback_msg
+        self._pending_timing_fallback_msg = None
+        if timing_msg and self._last_cmd is not None and "--use-fallback-timing" not in self._last_cmd:
+            use_fallback = messagebox.askyesno(
+                "FMIG Rat Reconstruction",
+                "Reconstruction stopped: this session's CT scanner log has degenerate "
+                "per-projection timestamps, so breathing-gated binning can't work from it "
+                "directly.\n\n"
+                f"{timing_msg}\n\n"
+                "Substitute the known-good timing template and retry? Output will be saved "
+                "under a folder ending in \"_fallback\" instead of the normal output folder, "
+                "so it stays clearly marked as using approximated timing.")
+            if use_fallback:
+                retry_cmd = self._last_cmd + ["--use-fallback-timing"]
+                self._launch_process(retry_cmd, self._active_step_labels, self._active_steps)
 
     # --------------------------------------------------------------- utils
     def _clear_log(self):

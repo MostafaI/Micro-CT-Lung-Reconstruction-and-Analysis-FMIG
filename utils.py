@@ -550,7 +550,7 @@ def get_intra_heterogeneity(im,
     return intra
 
 
-def save_image_MI_style(im, vmin, vmax, out_path, dpi=300):
+def save_image_MI_style(im, vmin, vmax, out_path, dpi=300, cmap="jet"):
     num_slices = im.shape[0]
     fig, axes = plt.subplots(
         1, num_slices, figsize=(16, 4), dpi=400, facecolor="k"
@@ -560,7 +560,7 @@ def save_image_MI_style(im, vmin, vmax, out_path, dpi=300):
         img = ax.imshow(
             im[i].T,
             origin="lower",
-            cmap="jet",
+            cmap=cmap,
             vmin=vmin,
             vmax=vmax,
         )
