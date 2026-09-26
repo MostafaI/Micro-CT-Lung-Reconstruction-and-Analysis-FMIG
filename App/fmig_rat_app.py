@@ -4,9 +4,9 @@ FMIG Rat Reconstruction - desktop GUI front-end for Automated-FMIG-Rat.ipynb.
 Pick a data folder, click Run, watch progress and preview images - no
 notebook, no copy/pasting paths or code cells.
 
-Runs pipeline_driver.py (next to this file) as a subprocess using the same
-"mi-env" conda environment the notebook itself uses, and streams its output
-live into this window.
+Runs pipeline_driver.py (next to this file) as a subprocess using the
+self-contained "general app" Python environment set up by
+../setup_environment.bat, and streams its output live into this window.
 """
 import json
 import os
@@ -26,7 +26,7 @@ except Exception:
     HAVE_PIL = False
 
 # The Left/Right Split editor runs in-process (unlike every other feature
-# here, which shells out to pipeline_driver.py in mi-env) - an interactive
+# here, which shells out to pipeline_driver.py in the general app env) - an interactive
 # drawing tool needs live redraws on every click, and a subprocess round
 # trip per click isn't workable. But `import pipeline_driver` alone takes
 # ~12s (it pulls in the whole recon/ITK/ANTs stack at module level) -
@@ -35,13 +35,38 @@ except Exception:
 # 12s cost even for someone who never opens the editor. _load_editor_deps()
 # below does the actual (slow, one-time, cached) import lazily, only when
 # the editor is actually opened.
-_editor_deps = None  # cache: None = not attempted, False = failed, dict = loaded
+_editor_deps = None  # cache: None = not loaded yet, dict = loaded
+_editor_deps_error = None  # last failure's traceback text, for the error dialog
+
+# This app runs under pythonw.exe, which has no console, so stderr output is
+# simply lost. Failures that matter are appended here instead.
+APP_ERROR_LOG = os.path.join(os.environ.get("LOCALAPPDATA", os.path.dirname(os.path.abspath(__file__))),
+                             "FMIG", "app_errors.log")
+
+
+def _log_app_error(context, text):
+    try:
+        os.makedirs(os.path.dirname(APP_ERROR_LOG), exist_ok=True)
+        with open(APP_ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {context} =====\n{text}\n")
+    except OSError:
+        pass
 
 
 def _load_editor_deps():
-    global _editor_deps
-    if _editor_deps is not None:
+    """Returns the dict of editor deps, or False if loading failed. A failure
+    is NOT cached - the next attempt retries - and its traceback is kept in
+    _editor_deps_error and appended to APP_ERROR_LOG."""
+    global _editor_deps, _editor_deps_error
+    if _editor_deps:
         return _editor_deps
+    # The general app env is an embeddable Python whose python310._pth fixes
+    # sys.path, so - unlike a normal install - the running script's own
+    # folder is NOT on sys.path and pipeline_driver.py (next to this file)
+    # can't be found unless we add it explicitly.
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
     try:
         import numpy as np
         import matplotlib
@@ -50,19 +75,87 @@ def _load_editor_deps():
         from matplotlib.figure import Figure
         import pipeline_driver as pd
         _editor_deps = dict(np=np, FigureCanvasTkAgg=FigureCanvasTkAgg, Figure=Figure, pd=pd)
-    except Exception as e:
-        _editor_deps = False
-        print(f"Left/Right Split editor dependencies failed to load: {e}", file=sys.stderr)
-    return _editor_deps
+        _editor_deps_error = None
+        return _editor_deps
+    except Exception:
+        import traceback
+        _editor_deps_error = traceback.format_exc()
+        _log_app_error("Left/Right Split editor dependencies failed to load", _editor_deps_error)
+        return False
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(APP_DIR)  # repo root, holds recon_functions_all.py etc.
-DRIVER = os.path.join(APP_DIR, "pipeline_driver.py")
 
-# The notebook's kernel ("mi-env") - see Automated-FMIG-Rat.ipynb metadata
-# and AppData/Roaming/jupyter/kernels/mi-env/kernel.json.
-MI_ENV_PYTHON = r"C:\Users\milabs\.conda\envs\mi-env\python.exe"
+
+def read_code_version():
+    """Code version from the repo's VERSION file (same source fmig_version.py
+    reads) - shown in the title bar and the run log."""
+    try:
+        with open(os.path.join(REPO_DIR, "VERSION"), "r", encoding="utf-8") as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+CODE_VERSION = read_code_version()
+DRIVER = os.path.join(APP_DIR, "pipeline_driver.py")
+SETUP_SCRIPT = os.path.join(REPO_DIR, "setup_environment.bat")
+
+# setup_environment.bat writes the env it built to a fixed pointer file (see
+# that script's own header comment for why: it may land at C:\FMIG_Env or,
+# if that's not writable, %LOCALAPPDATA%\FMIG_Env, and every consumer needs
+# to agree on which one without re-implementing that fallback itself).
+ENV_POINTER_FILE = os.path.join(os.environ.get("LOCALAPPDATA", APP_DIR), "FMIG", "env_location.txt")
+
+
+def resolve_general_python():
+    """Path to the general app env's python.exe (numpy/scipy/torch/... - set
+    up by setup_environment.bat), or None if it hasn't been set up yet."""
+    try:
+        with open(ENV_POINTER_FILE, "r", encoding="utf-8") as f:
+            install_root = f.read().strip()
+    except OSError:
+        return None
+    candidate = os.path.join(install_root, "python", "python.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def ensure_general_python():
+    """Returns a usable python.exe path, prompting to run setup_environment.bat
+    (and waiting for it) if the environment isn't set up yet. Returns None if
+    the user declines or setup doesn't succeed."""
+    python_exe = resolve_general_python()
+    if python_exe:
+        return python_exe
+
+    if not messagebox.askyesno(
+        "FMIG Rat Reconstruction",
+        "The Python environment this app needs hasn't been set up yet.\n\n"
+        "Run setup_environment.bat now? It downloads Python and the required "
+        "packages (a few hundred MB) into a self-contained folder - this "
+        "takes a few minutes and only needs to happen once."):
+        return None
+
+    if not os.path.isfile(SETUP_SCRIPT):
+        messagebox.showerror("FMIG Rat Reconstruction", f"setup_environment.bat not found at:\n{SETUP_SCRIPT}")
+        return None
+
+    try:
+        # Run setup and wait for it (it opens its own console window so
+        # progress is visible), then re-resolve.
+        subprocess.run(["cmd", "/c", "start", "/wait", "", SETUP_SCRIPT], cwd=REPO_DIR)
+    except Exception as e:
+        messagebox.showerror("FMIG Rat Reconstruction", f"Could not run setup_environment.bat:\n{e}")
+        return None
+
+    python_exe = resolve_general_python()
+    if not python_exe:
+        messagebox.showerror(
+            "FMIG Rat Reconstruction",
+            "Setup finished but the environment still isn't where it was expected. "
+            f"Check {SETUP_SCRIPT} ran without errors, then try again.")
+    return python_exe
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", APP_DIR), "FMIGRatApp")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -73,10 +166,11 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 # cfg["thresholds"][<normalized path>] once the user sets one via Check Threshold.
 DEFAULT_THRESHOLD = 0.5
 
-# RTKRecon is a separate, non-GitHub component that always lives under
-# Desktop/Pipeline directly - not a sibling of this file, since this file
-# ships inside the Micro-CT-Lung-Reconstruction-and-Analysis-FMIG repo.
-RTKRECON_DIR = r"C:\Users\milabs\Desktop\Pipeline\RTKRecon"
+# A runtime-only subset of RTKRecon (recon_client.py, recon_server.py,
+# recon_server_common.py, milabs_rtk_recon.py, start_recon_server.bat) is
+# vendored into this repo under vendor/RTKRecon - see REPO_DIR above. The full
+# RTKRecon project (notebooks, etc.) still lives at Desktop/Pipeline/RTKRecon.
+RTKRECON_DIR = os.path.join(REPO_DIR, "vendor", "RTKRecon")
 START_SERVER_BAT = os.path.join(RTKRECON_DIR, "start_recon_server.bat")
 SERVER_LOG = os.path.join(RTKRECON_DIR, "recon_server.log")
 if RTKRECON_DIR not in sys.path:
@@ -86,8 +180,8 @@ STEPS = [
     ("recon", "1. Reconstruction  (correct projections, breathing-gated recon)"),
     ("segment", "2. Segment  (compress, lung segmentation, cropped GIF)"),
     ("segment_lr", "3. Segment Left/Right lungs  (fix L/R split, save mLR masks, needs Segment)"),
-    ("analysis", "4. Analysis  (FRC / TLC maps)"),
-    ("register", "5. Register  (phase registration + deformation field)"),
+    ("analysis", "4. Analysis  (FRC/TLC maps; also generates TV/FV/J maps if Register has already run)"),
+    ("register", "5. Register EE to EI only  (phase registration + deformation field)"),
     ("register_all_phases", "6. Register All Phases to EI  (every phase -> R0, needed for the "
                              "expansion-time map, slow)"),
     ("diaphragm", "7. Diaphragm Motion  (descent estimate + GIF, needs Register)"),
@@ -586,6 +680,9 @@ class LRSplitEditor(tk.Toplevel):
                 os.path.basename(p) for p in mlr_paths) if mlr_paths else ""
         except Exception as e:
             mlr_msg = f"\n\n(Could not save the _mLR.nii.gz masks: {e})"
+        # Record which code version produced this session's L/R split output.
+        self.pd.record_code_version(self.main_dir, "segment_lr", outname=self.outname,
+                                    source="Left/Right Split editor")
         messagebox.showinfo(
             "Fix Left/Right Split",
             f"Saved:\n{path}\n\nThis session's Volume Analysis step will use this split from now on."
@@ -604,7 +701,7 @@ class LRSplitEditor(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FMIG Rat Reconstruction")
+        self.title(f"FMIG Rat Reconstruction {CODE_VERSION}")
         self.geometry("980x720")
         self.minsize(820, 600)
 
@@ -868,11 +965,13 @@ class App(tk.Tk):
         self.config(cursor="")
         self.status_var.set("Ready.")
         if not deps:
+            err = (_editor_deps_error or "").strip().splitlines()
             messagebox.showerror(
                 "FMIG Rat Reconstruction",
-                "This feature needs numpy/matplotlib and pipeline_driver importable in the "
-                "Python running this app (it should already be, since this app is normally "
-                "launched with mi-env's own python). See the console for the exact error.")
+                "The Left/Right Split editor could not load numpy/matplotlib/pipeline_driver "
+                "in this app's Python.\n\n"
+                + (err[-1] if err else "(no error text captured)")
+                + f"\n\nFull traceback appended to:\n{APP_ERROR_LOG}")
             if "segment_lr" in self.step_labels:
                 self.step_labels["segment_lr"].config(text="FAILED", foreground="#c00")
             return
@@ -1061,11 +1160,8 @@ class App(tk.Tk):
     def _run(self):
         if self.running:
             return
-        if not os.path.isfile(MI_ENV_PYTHON):
-            messagebox.showerror(
-                "FMIG Rat Reconstruction",
-                f"Could not find the Python environment used by the notebook:\n{MI_ENV_PYTHON}\n\n"
-                "Edit MI_ENV_PYTHON at the top of fmig_rat_app.py if it has moved.")
+        python_exe = ensure_general_python()
+        if not python_exe:
             return
 
         mode = self.mode_var.get()
@@ -1103,7 +1199,7 @@ class App(tk.Tk):
                 return
 
             active_labels = self.step_labels
-            cmd = [MI_ENV_PYTHON, "-u", DRIVER, main_dir,
+            cmd = [python_exe, "-u", DRIVER, main_dir,
                    "--steps", ",".join(subprocess_steps), "--threshold", f"{threshold:g}"]
             steps = subprocess_steps  # what _launch_process below should actually track
         else:
@@ -1126,7 +1222,7 @@ class App(tk.Tk):
             save_config(self.cfg)
 
             active_labels = self.group_step_labels
-            cmd = [MI_ENV_PYTHON, "-u", DRIVER]
+            cmd = [python_exe, "-u", DRIVER]
             for rat_dir in self.group_rats:
                 cmd += ["--rats", rat_dir]
             cmd += ["--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
@@ -1149,6 +1245,7 @@ class App(tk.Tk):
         self._clear_preview()
         self.last_artifacts = {}
 
+        self._log(f"FMIG code version: {CODE_VERSION}\n")
         self._log(f"$ {' '.join(cmd)}\n")
         try:
             self.proc = subprocess.Popen(

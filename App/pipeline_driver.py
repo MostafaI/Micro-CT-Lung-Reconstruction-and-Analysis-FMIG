@@ -16,8 +16,11 @@ Usage:
     --rats for multiple rats; mutually exclusive with the positional main_dir:
         python pipeline_driver.py --rats "D:\\Data\\PhNd7" --rats "D:\\Data\\PhNd9" --steps diaphragm
 
-Must be run with the "mi-env" conda environment's python.exe - the same
-kernel the notebook itself uses (see kernel.json / recon_phase.bat).
+Must be run with the "general app" environment's python.exe - the one
+setup_environment.bat (repo root) builds at <install root>\python\python.exe
+(fmig_rat_app.py resolves and passes this automatically; see its
+resolve_general_python()). The notebook itself still uses its own "mi-env"
+conda kernel (see kernel.json) - out of scope for setup_environment.bat.
 """
 import argparse
 import csv
@@ -75,6 +78,7 @@ from recon_functions import *
 from Analysis import *
 from utils import *
 from segment_from_projections import find_lungs
+from fmig_version import get_code_version, record_code_version
 import subprocess as _subprocess  # keep builtin 'subprocess' import below too
 
 import subprocess
@@ -150,26 +154,22 @@ def step_3(main_dir, corr_dir, marign=75, threshold=0.5):
     return xlimits
 
 
+# Number of breathing (time) phases - shared by the clustering plot (step_4)
+# and the reconstruction (create_milab_structure) so they bin identically.
+TIME_PHASES = 16
+
+
 def step_4(main_dir, xlimits, threshold):
     ts = time.time()
     s, t, a = get_signal_from_image(os.path.join(main_dir, 'ct-data', 'corr'), subtract_baseline=1,
                                      spring=False, rabbit=False, xlimits=xlimits, threshold=threshold)
     print(f'Took {round((time.time() - ts) / 60, 2)} minutes.')
-    plt.figure(figsize=(7, 4))
-    plt.plot(t, s)
-    plt.close()
-    plt.figure(figsize=(7, 4))
-    b = fancy_binning(a, s, t, flip_signal=False, only_phase_binning=0)
-    b.nbins = 16
-    b.max_freq = 100
-    b.binning(plot=1, withline=True)
-    plt.xlim([-0.05, 1.05])
-    plt.ylim([-0.05, 1.2])
+    # Same binning code + settings as the reconstruction (create_milab_structure
+    # -> new_binning -> run_time_binning), so this plot shows exactly the
+    # labels that become the Phase_<n> folders.
     out_png = os.path.join(main_dir, 'clustering_result.png')
-    plt.savefig(out_png, dpi=100, bbox_inches='tight')
-    plt.close()
+    run_time_binning(s, t, a, TIME_PHASES, only_phase_binning=0, plot_path=out_png)
     log_artifact(out_png)
-    b.get_approximate_breathing_rate()
     return s, t, a
 
 def clean_study_folder(session):
@@ -201,7 +201,7 @@ def MI_reconstruction(main_dir, threshold=0.5, use_fallback_timing=False):
     s, t, a = step_4(main_dir, xlimits, threshold)
     create_milab_structure(main_dir,
                             intensity_phases=10,
-                            time_phases=16,
+                            time_phases=TIME_PHASES,
                             spring=False,
                             s=s, t=t, a=a,
                             only_phase_binning=0,
@@ -221,9 +221,11 @@ def MI_reconstruction(main_dir, threshold=0.5, use_fallback_timing=False):
     return
 
 
-# RTKRecon is a separate, non-GitHub component that always lives under
-# Desktop/Pipeline directly, regardless of where this script/repo sits.
-RTKRECON_DIR = r"C:\Users\milabs\Desktop\Pipeline\RTKRecon"
+# A runtime-only subset of RTKRecon (recon_client.py, recon_server.py,
+# recon_server_common.py, milabs_rtk_recon.py, start_recon_server.bat) is
+# vendored into this repo under vendor/RTKRecon. The full RTKRecon project
+# (notebooks, etc.) still lives at Desktop/Pipeline/RTKRecon.
+RTKRECON_DIR = os.path.join(PIPELINE_DIR, "vendor", "RTKRecon")
 
 
 def _recon_via_warm_server(ROOT_DIR):
@@ -259,7 +261,7 @@ def recon(ROOT_DIR):
         pass  # RTKRecon/recon_client.py missing - fall back below
 
     print("recon server not running - falling back to a fresh subprocess "
-          "(start RTKRecon/start_recon_server.bat to skip the itk/rtk warm-up next time).",
+          "(start vendor/RTKRecon/start_recon_server.bat to skip the itk/rtk warm-up next time).",
           flush=True)
     BAT_PATH = os.path.join(PIPELINE_DIR, "recon_phase.bat")
     EXTRA_ARGS = []
@@ -2265,6 +2267,13 @@ def resolve_outname(main_dir):
     return BASE_OUTNAME
 
 
+def _step_done(main_dir, step, **details):
+    """Marks a step done for the GUI and records, in the session folder's
+    fmig_code_version.json, which code version produced its output."""
+    log_done(step)
+    record_code_version(main_dir, step, outname=outname, **details)
+
+
 def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=False):
     """announce_done=False suppresses the trailing "===ALL_DONE===" marker -
     used by run_group(), which calls this once per session, so the GUI
@@ -2295,7 +2304,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
             return 1
         if outname != BASE_OUTNAME:
             print(f"Using fallback output folder: {outname}", flush=True)
-        log_done("recon")
+        _step_done(main_dir, "recon", threshold=threshold, use_fallback_timing=use_fallback_timing)
 
     if "segment" in steps:
         log_step("segment")
@@ -2307,7 +2316,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("segment", e)
             return 1
-        log_done("segment")
+        _step_done(main_dir, "segment")
 
     if "segment_lr" in steps:
         log_step("segment_lr")
@@ -2317,7 +2326,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("segment_lr", e)
             return 1
-        log_done("segment_lr")
+        _step_done(main_dir, "segment_lr")
 
     if "analysis" in steps:
         log_step("analysis")
@@ -2358,7 +2367,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("analysis", e)
             return 1
-        log_done("analysis")
+        _step_done(main_dir, "analysis")
 
     if "register" in steps:
         log_step("register")
@@ -2368,7 +2377,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("register", e)
             return 1
-        log_done("register")
+        _step_done(main_dir, "register")
 
     if "register_all_phases" in steps:
         # Every phase (1-15) registered onto R0/EI, not just the one phase
@@ -2386,7 +2395,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("register_all_phases", e)
             return 1
-        log_done("register_all_phases")
+        _step_done(main_dir, "register_all_phases")
 
     if "diaphragm" in steps:
         log_step("diaphragm")
@@ -2395,7 +2404,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("diaphragm", e)
             return 1
-        log_done("diaphragm")
+        _step_done(main_dir, "diaphragm")
 
     if "volume_analysis" in steps:
         log_step("volume_analysis")
@@ -2404,7 +2413,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
         except Exception as e:
             log_failed("volume_analysis", e)
             return 1
-        log_done("volume_analysis")
+        _step_done(main_dir, "volume_analysis")
 
     if announce_done:
         print("\n===ALL_DONE===", flush=True)
@@ -2434,17 +2443,31 @@ def get_rat_session_dirs(rat_dir):
 
 def compute_session_lung_volumes(main_dir, outname):
     """
-    Air volume (mL) at this session's own true end-inspiration (largest
-    lung mask across the 16-phase cycle) and end-expiration (smallest)
-    phases, split into left/right lungs at the mediastinal gap - the same
-    direct, registration-independent method used throughout this
-    conversation's manual FRC/TLC/TV checks. Needs only raw.npy/mask.npy/
-    affine.npy (the Segment step), no Register step required, and uses
-    each session's own detected EI/EE phase rather than assuming a fixed
-    phase number - confirmed on real data that the true min/max-volume
-    phase varies session to session (e.g. one PhNd31 session's true EE
-    was phase 11, another's was phase 10, neither is the pipeline's
+    Air volume (mL) at this session's own true end-inspiration and
+    end-expiration phases, split into left/right lungs at the mediastinal
+    gap - the same direct, registration-independent method used throughout
+    this conversation's manual FRC/TLC/TV checks. Needs only raw.npy/
+    mask.npy/affine.npy (the Segment step), no Register step required, and
+    uses each session's own detected EI/EE phase rather than assuming a
+    fixed phase number - confirmed on real data that the true min/max-
+    volume phase varies session to session (e.g. one PhNd31 session's true
+    EE was phase 11, another's was phase 10, neither is the pipeline's
     default registration phase 7).
+
+    EI/EE are selected by whichever phase has the most/least whole-lung
+    HU-weighted air content (the same quantity TLC/FRC/TV are computed
+    from) - NOT by mask voxel count, which an earlier version of this
+    function used as a proxy. The two don't always agree: confirmed on
+    real data (PhNd29 2026-09-10_13h48) that the largest-mask phase (R13)
+    actually had LESS air content (4.930 mL) than R15 (5.313 mL) - a
+    bigger segmented mask isn't necessarily the most air-filled one
+    (partial-volume/boundary tissue can inflate mask size without adding
+    much air). Picking EI/EE by mask size but then measuring air content
+    at that phase silently undercounted TLC (and therefore TV) whenever
+    the two signals disagreed - on that session, by about 18%. Selecting
+    both phases by air content itself keeps the selection criterion and
+    the measured quantity consistent, so this can only raise (never
+    lower) the measured TLC-FRC swing relative to the old mask-size method.
 
     Raises FileNotFoundError if the Segment step hasn't been run yet.
     """
@@ -2462,12 +2485,14 @@ def compute_session_lung_volumes(main_dir, outname):
     zooms = np.abs(np.diag(affine))[:3]
     voxel_vol_mm3 = float(zooms[0] * zooms[1] * zooms[2])
 
-    sizes = masks.sum(axis=(1, 2, 3))
-    ei_phase, ee_phase = int(np.argmax(sizes)), int(np.argmin(sizes))
-    override = load_lr_split_override(main_dir, outname)
-
     def air_ml(img, ai, aj, ak):
         return float((img[ai, aj, ak] / -1000.0).sum() * voxel_vol_mm3 / 1000.0)
+
+    air_by_phase = np.array([
+        air_ml(imgs[p], *np.where(masks[p].astype(bool))) for p in range(masks.shape[0])
+    ])
+    ei_phase, ee_phase = int(np.argmax(air_by_phase)), int(np.argmin(air_by_phase))
+    override = load_lr_split_override(main_dir, outname)
 
     def phase_lr(phase_idx):
         mask = masks[phase_idx].astype(bool)
@@ -2879,6 +2904,8 @@ def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False):
                 for d in register_baseline_for_rat(rat_dir, baseline_outname, sessions=sessions):
                     log_artifact(d)
                 log_done("register_to_baseline")
+                record_code_version(rat_dir, "register_to_baseline", outname=baseline_outname,
+                                    sessions=[os.path.basename(os.path.normpath(s)) for s in sessions])
             except Exception as e:
                 overall_rc = 1
                 log_failed("register_to_baseline", e)
@@ -2910,6 +2937,7 @@ def main():
                               "'<outname>'. Only pass this after the user has explicitly confirmed "
                               "it (the GUI shows a prompt when recon hits this).")
     args = parser.parse_args()
+    print(f"FMIG code version: {get_code_version()}", flush=True)
 
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
     unknown = set(steps) - set(STEP_ORDER)

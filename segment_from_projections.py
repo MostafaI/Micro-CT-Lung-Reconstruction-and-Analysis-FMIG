@@ -1,3 +1,4 @@
+import os
 import sys
 
 import numpy as np
@@ -7,8 +8,14 @@ from scipy import ndimage
 
 # find_lungs() reuses the UNet architecture and the exact preprocessing/inference
 # helpers already built and tested in the Rat-lung-segmentation-from-xray project
-# (model.py, real_inference.py), rather than duplicating that logic here.
-PROJECT_DIR = r"C:\Users\milabs\Desktop\Pipeline\Rat-lung-segmentation-from-xray"
+# (model.py, real_inference.py), rather than duplicating that logic here. A
+# runtime-only subset of that project (model.py, a trimmed real_inference.py, and
+# the checkpoint find_lungs() loads) is vendored into this repo under vendor/ -
+# see vendor/Rat-lung-segmentation-from-xray - so this file has no dependency
+# outside the repo. The full project (training, dashboard, notebooks) still lives
+# at Desktop/Pipeline/Rat-lung-segmentation-from-xray.
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.join(REPO_DIR, "vendor", "Rat-lung-segmentation-from-xray")
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
@@ -42,7 +49,7 @@ def _diaphragm_curve(mask_bin):
 
 
 def find_lungs(TIFF_PATH,
-              CHECKPOINT = r"C:\Users\milabs\Desktop\Pipeline\Rat-lung-segmentation-from-xray\checkpoints\best_model_1.pt"):
+              CHECKPOINT = os.path.join(PROJECT_DIR, "checkpoints", "best_model_1.pt")):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet().to(device)
     state = torch.load(CHECKPOINT, map_location=device)

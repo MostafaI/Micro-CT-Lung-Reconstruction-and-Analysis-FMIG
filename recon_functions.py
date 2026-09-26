@@ -1,3 +1,4 @@
+import struct
 import os 
 import numpy as np 
 import nibabel as nib 
@@ -36,13 +37,75 @@ class DegenerateTimingError(Exception):
     pass
 
 
+LEADING_TIMESTAMP_SENTINEL = -99999.0
+
+
+def _backup_proj_log(logpath):
+    """Renames logpath to its '_original.csv' sibling, unless that backup
+    already exists (e.g. the leading-sentinel fix below already made one
+    this same call) - reusing that same backup instead of trying to rename
+    onto an already-taken filename, which would raise on Windows."""
+    backup_path = logpath.replace('.csv', '_original.csv')
+    if not os.path.isfile(backup_path):
+        os.rename(logpath, backup_path)
+    else:
+        os.remove(logpath)
+
+
+def _fix_leading_timestamp_sentinel(logpath, lines):
+    """Sometimes only the VERY FIRST projection's timestamp comes back as
+    the scanner's -99999 sentinel while every other row is a real, valid
+    timestamp (seen on real data - H05 2026-09-23_15h20: 1 bad row out of
+    11,520). check_timing's whole-log degenerate check below doesn't catch
+    this - thousands of otherwise-good unique timestamps easily clear its
+    "len(unique) > 10" bar - and even if it did, its fix (substituting a
+    completely unrelated generic timing template for the whole session)
+    would be a wildly disproportionate cure for one bad row.
+
+    This isn't cosmetic: fancy_binning.interpolate_signal() uses
+    self.t[0] as one endpoint of the entire breathing-signal interpolation
+    grid (new_time = np.linspace(self.t[0], self.t[-1], ...)) - a -99999
+    first timestamp corrupts that whole grid (spanning ~-99999 to +a few
+    hundred instead of ~19 to +a few hundred), which corrupts breathing-rate
+    estimation and phase gating for the entire session, not just one frame.
+
+    Fix: extrapolate the missing first timestamp backward from the steady
+    cadence of the next two real points - lapsed_time = timing[2] -
+    timing[1], replacement = timing[1] - lapsed_time. Returns the
+    (possibly unchanged) lines array; always applied automatically (unlike
+    the whole-log fallback below, no use_fallback opt-in needed) since it
+    only repairs one clearly-invalid value from its own session's real
+    neighboring data, rather than discarding real data for a foreign
+    template.
+    """
+    timing = lines[:, 3]
+    if len(timing) <= 2 or timing[0] != LEADING_TIMESTAMP_SENTINEL:
+        return lines
+    if timing[1] == LEADING_TIMESTAMP_SENTINEL or timing[2] == LEADING_TIMESTAMP_SENTINEL:
+        return lines  # more than just the leading row is bad - let the whole-log check below handle it
+
+    lapsed_time = timing[2] - timing[1]
+    fixed_first = timing[1] - lapsed_time
+    print(f"\t\tFirst projection timestamp was the {LEADING_TIMESTAMP_SENTINEL} sentinel - replacing it with "
+          f"{fixed_first:.4f} (extrapolated backward from timepoints 1-2's spacing of {lapsed_time:.4f}s).")
+    lines = lines.copy()
+    lines[0, 3] = fixed_first
+    _backup_proj_log(logpath)
+    with open(logpath, 'w') as proj_file_new:
+        for line in lines:
+            proj_file_new.write(','.join(line.astype(str)) + '\n')
+    return lines
+
+
 def check_timing(main_dir, use_fallback=False):
     """Returns True if the fallback timing template was actually substituted
     in for this session, False if this session's own timestamps were fine
     (or too malformed to even check) - callers use this to decide whether
     this specific session's output belongs in the normal or "_fallback"
     output folder, so a batch run doesn't mislabel sessions that never
-    needed the fallback in the first place."""
+    needed the fallback in the first place. (A leading-sentinel repair - see
+    _fix_leading_timestamp_sentinel - does NOT count as "fallback used": it
+    keeps this session's own real timing, so still returns False.)"""
     logpath = os.path.join(main_dir,'ct-data', 'proj_000_0_log.csv')
     # check timing
     file = open(logpath); lines= file.readlines() ; file.close()
@@ -52,6 +115,8 @@ def check_timing(main_dir, use_fallback=False):
     if lines.shape[1] < 4:
         print("\t\tProblem with timeStamps in the proj_log.csv file")
         return False
+
+    lines = _fix_leading_timestamp_sentinel(logpath, lines)
 
     timing = lines[:, 3]
     if len(np.unique(timing)) > 10:
@@ -68,18 +133,99 @@ def check_timing(main_dir, use_fallback=False):
     # Fix Timing
     times = np.load('./sample_times_32p_55kv_37ma_20ms.npy')
     lines[:,3] = times
-    os.rename(logpath, logpath.replace('.csv','_original.csv'))
+    _backup_proj_log(logpath)
     proj_file_new = open(logpath, 'w')
     for line in lines: proj_file_new.write(','.join(line.astype(str)) + '\n')
     proj_file_new.close()
     print('Created a new timing from save time samples')
     return True
 
+def _simple_tiff_layout(fh):
+    """Parses just enough of a TIFF header to find the pixel data of an
+    uncompressed, single-strip, single-channel 16-bit image. Returns
+    (data_offset, width, height, numpy_dtype) or None for anything else
+    (the caller then falls back to PIL). Much cheaper than PIL's header
+    parse, which holds the GIL and capped threaded throughput."""
+    head = fh.read(8)
+    if len(head) < 8 or head[:2] not in (b'II', b'MM'):
+        return None
+    bo = '<' if head[:2] == b'II' else '>'
+    if struct.unpack(bo + 'H', head[2:4])[0] != 42:
+        return None  # not classic TIFF (e.g. BigTIFF)
+    ifd = struct.unpack(bo + 'I', head[4:8])[0]
+    fh.seek(ifd)
+    raw = fh.read(2)
+    if len(raw) < 2:
+        return None
+    n = struct.unpack(bo + 'H', raw)[0]
+    entries = fh.read(12 * n)
+    if len(entries) < 12 * n:
+        return None
+    tags = {}
+    for k in range(n):
+        tag, typ, count = struct.unpack(bo + 'HHI', entries[12 * k:12 * k + 8])
+        if typ == 3 and count == 1:
+            val = struct.unpack(bo + 'H', entries[12 * k + 8:12 * k + 10])[0]
+        elif typ == 4 and count == 1:
+            val = struct.unpack(bo + 'I', entries[12 * k + 8:12 * k + 12])[0]
+        else:
+            val = None  # multi-valued (e.g. several strips) - not our simple case
+        tags[tag] = (count, val)
+    def one(tag, default=None):
+        count, val = tags.get(tag, (1, default))
+        return val if count == 1 else None
+    width, height = one(256), one(257)
+    if (width is None or height is None or one(258) != 16 or one(259, 1) != 1
+            or one(277, 1) != 1 or one(339, 1) != 1 or one(273) is None):
+        return None
+    return one(273), width, height, np.dtype(bo + 'u2')
+
+
+def _raw_tiff_rows(image_path, row_slice):
+    """Reads only rows `row_slice` of an uncompressed, single-strip 16-bit
+    grayscale TIFF straight from disk, skipping PIL's full-frame decode.
+    Returns None when the file isn't in that simple layout (the caller then
+    falls back to PIL)."""
+    with open(image_path, 'rb') as fh:
+        layout = _simple_tiff_layout(fh)
+        if layout is None:
+            return None
+        offset, width, height, dtype = layout
+        start, stop, step = row_slice.indices(height)
+        if step != 1 or stop <= start:
+            return None
+        fh.seek(offset + start * width * 2)
+        rows = np.fromfile(fh, dtype=dtype, count=(stop - start) * width)
+    if rows.size != (stop - start) * width:
+        return None  # truncated file - let PIL report it properly
+    return rows.reshape(stop - start, width)
+
+
+def _threshold_lut(threshold):
+    """lut[v] == (v / 65535 if v / 65535 <= threshold else 0.0), computed with
+    the exact same float64 ops as the per-pixel version, so lut[raw] gives
+    bit-identical values while doing a single gather instead of a divide, a
+    compare and a masked write on every pixel of every projection."""
+    lut = np.arange(65536, dtype=np.uint16) / 65535
+    lut[lut > threshold] = 0
+    return lut
+
+
 def get_signal_from_image(folder, array=[], xlimits=[300, 500],
                           ylimits=[0, -1], subtract_baseline=False, spring=False, bm3d=False,
-                          rabbit=False, threshold=0.8, n_workers=8):
+                          rabbit=False, threshold=0.8, n_workers=64):
+    # n_workers: reads are I/O-bound once PIL decoding is skipped; on this
+    # RAID, cold-cache reads kept speeding up to 64 threads (38.9s at 16 -> 26.5s
+    # at 64 for 11,520 projections) with no cost when files are already cached.
+    lut = _threshold_lut(threshold)
+
     def _read_one_projection(args):
         image_path, xlimits, ylimits, threshold = args
+        # Fast path: read only the needed rows from disk and map them through
+        # the threshold lookup table - bit-identical to the PIL path below.
+        rows = _raw_tiff_rows(image_path, slice(xlimits[0], xlimits[1]))
+        if rows is not None:
+            return float(lut[rows[:, ylimits[0]:ylimits[1]]].mean())
         im = np.asarray(Image.open(image_path)).astype(np.uint16)
         # crop to the region actually used by the mean BEFORE normalizing/thresholding,
         # instead of doing that elementwise work over the whole (mostly-unused) frame
@@ -226,12 +372,32 @@ def get_unique_angles(lines):
 
 
     
-def new_binning(s,t,a, PB_num, LAB_num,only_phase_binning=False):
-    b = fancy_binning(a,s,t,only_phase_binning=only_phase_binning)
-    b.nbins = PB_num
+def run_time_binning(s, t, a, n_phases, only_phase_binning=False, plot_path=None):
+    """The single breathing-phase (time) binning used by BOTH the
+    reconstruction (new_binning -> create_milab_structure) and the app's
+    clustering_result.png (pipeline_driver.step_4). Same class, same
+    settings, same (deterministic) clustering - so the plot shows exactly
+    the labels that become the Phase_<n> folders. If plot_path is given,
+    the clustering scatter is also saved there.
+    Returns (real_time, real_amps, signal_normalized, labels, breathing_rate)."""
+    b = fancy_binning(a, s, t, only_phase_binning=only_phase_binning)
+    b.nbins = n_phases
     br = b.get_approximate_breathing_rate()
+    if plot_path:
+        plt.figure(figsize=(7, 4))
     # return_centroid:  return rep_times, rep_values, self.normalize_signal(), labels
-    real_time, real_amps, signal_normalized, bins = b.binning(return_centroid = True)
+    real_time, real_amps, signal_normalized, bins = b.binning(plot=bool(plot_path), return_centroid=True)
+    if plot_path:
+        plt.xlim([-0.05, 1.05])
+        plt.ylim([-0.05, 1.2])
+        plt.savefig(plot_path, dpi=100, bbox_inches='tight')
+        plt.close()
+    return real_time, real_amps, signal_normalized, bins, br
+
+
+def new_binning(s,t,a, PB_num, LAB_num,only_phase_binning=False):
+    real_time, real_amps, signal_normalized, bins, br = run_time_binning(
+        s, t, a, PB_num, only_phase_binning=only_phase_binning)
     lab = np.digitize(signal_normalized, np.linspace(signal_normalized.min(), signal_normalized.max(), LAB_num + 1), right=False)
     pb = bins
     min_amp, max_amp = np.zeros(pb.shape), np.zeros(pb.shape)
@@ -507,16 +673,20 @@ class fancy_binning():
             # Fit KMeans with line-constrained centroids
             kmeans.fit(X)
             labels     = kmeans.predict(X)
-            centroids = kmeans.centroids
-            centroids = centroids[np.argsort(centroids[:,1])]
-            rep_times, rep_values = centroids[:,1], centroids[:,0]  
+            # Already in phase order (row k = phase k). If phase 0's centroid
+            # sits just before the period end, express its time as negative
+            # so rep_times stays increasing AND aligned with the labels.
+            centroids = kmeans.centroids.copy()
+            if centroids[0, 1] > kmeans.period / 2:
+                centroids[0, 1] -= kmeans.period
+            rep_times, rep_values = centroids[:,1], centroids[:,0]
         if plot:
             colors = mpl.rcParams['axes.prop_cycle'].by_key()['color']
             colors = colors * 2
             # Visualize the data points and cluster centers
             # plt.figure(figsize=(8, 6))
             # for i in range(16):  plt.axvspan(i/16 * X[:,1].max(),(i+1)/16 * X[:,1].max(), color=colors[i], alpha=0.2)
-            plt.scatter(X[:, 1], X[:, 0], c=labels, cmap='tab20')
+            plt.scatter(X[:, 1], X[:, 0], c=labels, cmap='tab20', vmin=0, vmax=self.nbins - 1)
             plt.scatter(rep_times, rep_values, marker='x', s=200, c='red', label='Bin Centers')
             plt.title('Binning Based on K-Means Clustering')
             plt.plot(rep_times , rep_values, linewidth=3, color='k', label='Breathing Signal')
@@ -668,29 +838,58 @@ class fancy_binning():
 
 
 class KMeansWithLineCentroids:
+    """K-means on (signal, normalized time) points with centroids kept on the
+    representative breathing line. Column 1 of data/centroids is time in
+    [0, period).
+
+    Periodicity: only phase 0 - the cluster whose centroid is CURRENTLY
+    circularly closest to t=0 - spans the period boundary, so only it uses
+    wrapped (time +/- period) distances and a circular time mean. Every
+    other cluster, including the last phase, uses plain distances and a
+    plain mean, so no other phase can pick up points from the far side of
+    the cycle.
+
+    After fit(), centroids are ordered phase 0 first, then the rest by
+    time, so predict() returns labels where 0 is the phase at the start of
+    the cycle and n_clusters-1 the latest.
+    """
     def __init__(self, n_clusters, line, max_iters=100,with_line=True, period=1):
         self.n_clusters = n_clusters
         self.max_iters = max_iters
         self.line = line  # The line defined by x and y coordinates
         self.with_line = with_line
         self.period = period
-        
-    def periodic_centroids(self, data, labels):
+
+    def _boundary_clusters(self, centroids):
+        """[index of phase 0]: the cluster whose centroid time is circularly
+        closest to t=0 (its centroid may sit just after 0 or just before
+        the period). The only cluster allowed to wrap."""
+        t = np.mod(centroids[:, 1], self.period)
+        circ = np.minimum(t, self.period - t)
+        return [int(np.argmin(circ))]
+
+    def _phase_order(self, centroids):
+        """Cluster indices in phase order: phase 0 first, then the rest by time."""
+        p0 = self._boundary_clusters(centroids)[0]
+        rest = [int(i) for i in np.argsort(centroids[:, 1], kind='stable') if i != p0]
+        return [p0] + rest
+
+    def periodic_centroids(self, data, labels, boundary):
         T = self.period
         clusters = []
         for i in range(self.n_clusters):
             set_cluster_i = data[labels == i]
             cluster_y = set_cluster_i[:,0].mean()
             x = set_cluster_i[:,1]
+            if i not in boundary:
+                clusters.append([cluster_y, x.mean()])
+                continue
             left = x[x < T/2]
-            right = [xi for xi in x if xi not in left]
-            count_left, count_right = len(left) , len(right) 
+            right = x[x >= T/2]
+            count_left, count_right = len(left) , len(right)
             mean_left, mean_right = 0,0
             if count_left !=0: mean_left = np.mean(left)
             if count_right !=0: mean_right = np.mean(right)
-            # print(count_left, count_right, cluster_y)
-            # if count_left ==0 and count_right==0:
-            #     custer_x = np.nan
             if np.abs(mean_right - mean_left) < T/2:
                 cluster_x = (mean_left*count_left+ mean_right*count_right) / (count_right+count_left)
             else:
@@ -700,13 +899,21 @@ class KMeansWithLineCentroids:
         clusters = np.array(clusters)
         return clusters
 
+    def _distances(self, data, boundary):
+        """Point-to-centroid distances; for phase 0 only, the minimum over
+        the raw and the time-wrapped (+/- period) point."""
+        distances = np.linalg.norm(data[:, np.newaxis] - self.centroids, axis=2)
+        for shift in (-self.period, self.period):
+            shifted = data.copy()
+            shifted[:, 1] += shift
+            d = np.linalg.norm(shifted[:, np.newaxis] - self.centroids[boundary], axis=2)
+            distances[:, boundary] = np.minimum(distances[:, boundary], d)
+        return distances
+
     def fit(self, data):
         self.data = data
-        self.data2 = np.concatenate([data[:,0].reshape(-1,1), (data[:,1]-1).reshape(-1,1)], axis=1)
-        
-
         n_samples, n_features = data.shape
-        
+
         line_x = self.line[:, 1]
         line_y = self.line[:, 0]
 
@@ -721,21 +928,17 @@ class KMeansWithLineCentroids:
 
         for _ in range(self.max_iters):
             self.n_inter += 1
-            # Assign each data point to the nearest centroid
-            distances_1 = np.linalg.norm(data[:, np.newaxis] - self.centroids, axis=2)
-            distances_2 = np.linalg.norm(self.data2[:, np.newaxis] - self.centroids, axis=2)
-            d_all = np.concatenate([distances_1.reshape(-1,16,1), distances_2.reshape(-1,16,1)], axis=2)
-            distances = np.min(d_all, axis=2)
-            labels = np.argmin(distances, axis=1)
-            # Update centroids as the mean of the assigned data points
-            # return data, labels
-            # new_centroids = np.array([data[labels == i].mean(axis=0) for i in range(self.n_clusters)])
-            new_centroids = self.periodic_centroids(data, labels)
+            boundary = self._boundary_clusters(self.centroids)
+            labels = np.argmin(self._distances(data, boundary), axis=1)
+            new_centroids = self.periodic_centroids(data, labels, boundary)
             if self.with_line: new_centroids = self.project_centroids_onto_line(new_centroids)
             # Check for convergence using a tolerance level
             if np.allclose(new_centroids, self.centroids):
                 break
             self.centroids = new_centroids
+        # Relabel: label 0 = phase 0 (the wrapping cluster at the cycle start),
+        # then the remaining phases in time order.
+        self.centroids = self.centroids[self._phase_order(self.centroids)]
 
     def project_centroids_onto_line(self, centroids):
         # Initialize an array to store the projected centroids
@@ -754,11 +957,8 @@ class KMeansWithLineCentroids:
         return projected_centroids
 
     def predict(self, data):
-        distances_1 = np.linalg.norm(data[:, np.newaxis] - self.centroids, axis=2)
-        distances_2 = np.linalg.norm(self.data2[:, np.newaxis] - self.centroids, axis=2)
-        d_all = np.concatenate([distances_1.reshape(-1,16,1), distances_2.reshape(-1,16,1)], axis=2)
-        distances = np.min(d_all, axis=2)
-        labels = np.argmin(distances, axis=1)
+        boundary = self._boundary_clusters(self.centroids)
+        labels = np.argmin(self._distances(data, boundary), axis=1)
             
         # distances = np.linalg.norm(data[:, np.newaxis] - self.centroids, axis=2)
         # labels = np.argmin(distances, axis=1)
