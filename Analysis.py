@@ -394,12 +394,19 @@ def get_maps(main_dir , outname, progress_callback=None, **kwargs):
     if progress_callback is not None: progress_callback(4, 4) # Done
     return
 
-def save_combined_maps_figure(maps_dir, out_name="maps.png", label_pad_px=300, bg=(0, 0, 0)):
-    order = ["FRC", "TLC", "TV", "FV", "J"]
-    smooth = ['TV']
+def save_combined_maps_figure(maps_dir, out_name="maps.png", label_pad_px=300, bg=(0, 0, 0),
+                              order=None, smooth=None):
+    # (row label, PNG stem). TLC is no longer shown; the Time Maps step's
+    # expansion time (first-harmonic phase) and tau rows appear once it has run.
+    # order/smooth can be overridden, e.g. to rebuild an older maps.png layout.
+    if order is None:
+        order = [("FRC", "FRC"), ("Exp. time", "expansion_time"), ("TV", "TV"), ("FV", "FV"),
+                 ("J", "J"), ("Tau", "tau")]
+    if smooth is None:
+        smooth = ['TV', 'expansion_time', 'tau']
     items = [] 
-    for name in order:
-        p = os.path.join(maps_dir, f"{name}.png") if name not in smooth else os.path.join(maps_dir, f"{name}_smoothed.png")
+    for name, stem in order:
+        p = os.path.join(maps_dir, f"{stem}.png") if stem not in smooth else os.path.join(maps_dir, f"{stem}_smoothed.png")
         if os.path.exists(p):
             img = Image.open(p).convert("RGBA")
             items.append((name, img))
@@ -417,16 +424,20 @@ def save_combined_maps_figure(maps_dir, out_name="maps.png", label_pad_px=300, b
         padded.append((name, img))
 
     total_h = sum(img.size[1] for _, img in padded)
-    out_w = label_pad_px + max_w
-
-    out = Image.new("RGBA", (out_w, total_h), bg + (255,))
-    draw = ImageDraw.Draw(out)
 
     # Font (tries a common font; falls back safely)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 120)
     except Exception:
         font = ImageFont.load_default()
+    # Widen the label margin to fit the longest row label (e.g. "Exp. time").
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    widest = max(measure.textbbox((0, 0), name, font=font)[2] for name, _ in padded)
+    label_pad_px = max(label_pad_px, widest + 40)
+    out_w = label_pad_px + max_w
+
+    out = Image.new("RGBA", (out_w, total_h), bg + (255,))
+    draw = ImageDraw.Draw(out)
 
     y = 0
     for name, img in padded:

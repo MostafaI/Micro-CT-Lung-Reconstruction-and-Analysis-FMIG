@@ -186,6 +186,7 @@ STEPS = [
                              "expansion-time map, slow)"),
     ("diaphragm", "7. Diaphragm Motion  (descent estimate + GIF, needs Register)"),
     ("volume_analysis", "8. Volume Analysis  (FRC/TLC/TV per lung, needs Segment)"),
+    ("time_maps", "9. Time Maps  (expansion time / arrival / EI time / tau per voxel, needs Register All Phases)"),
 ]
 
 # Group Analysis only - registering to a rat's own baseline session needs
@@ -195,7 +196,7 @@ STEPS = [
 # mode's one-session-at-a-time model. See pipeline_driver.run_group /
 # register_baseline_for_rat.
 GROUP_ONLY_STEPS = [
-    ("register_to_baseline", "9. Register to Baseline  (align each later session's R0 onto the rat's "
+    ("register_to_baseline", "10. Register to Baseline  (align each later session's R0 onto the rat's "
                               "first session, needs Segment)"),
 ]
 ALL_STEPS = STEPS + GROUP_ONLY_STEPS

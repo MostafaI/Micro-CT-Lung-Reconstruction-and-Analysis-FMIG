@@ -48,7 +48,7 @@ if PIPELINE_DIR not in sys.path:
 os.chdir(PIPELINE_DIR)  # some helper functions use relative/CWD-relative paths
 
 STEP_ORDER = ["recon", "segment", "segment_lr", "analysis", "register", "register_all_phases",
-              "diaphragm", "volume_analysis", "register_to_baseline"]
+              "diaphragm", "volume_analysis", "time_maps", "register_to_baseline"]
 
 
 def log_step(name):
@@ -937,7 +937,84 @@ MAP_COLORMAPS = {
     "TV": "viridis",
     "FV": "hot",
     "J": "magma",
+    "Expansion time": "coolwarm",  # first-harmonic phase (Time Maps step): blue = earlier, red = later
+    "Tau": "cividis",  # expiratory time constant (Time Maps step)
 }
+
+
+# Time Maps step outputs shown in the functional-map panels:
+# (panel title, NIfTI stem in Results/Maps, fixed display range).
+PANEL_TIME_MAPS = {
+    "expansion": ("Expansion time", "expansion_time_ms", (-50.0, 50.0)),
+    "tau": ("Tau", "tau_ms", (50.0, 200.0)),
+}
+_NAN_MAP_OFFSET = 100000.0  # lifts every real value off 0 so 0 can mean "outside the lung"
+
+
+def _nan_map_projection(vol, mask, axis):
+    """Mean projection of a map that uses NaN (not 0) for "no value", so a
+    real 0 (e.g. a relative time exactly equal to the whole lung's) isn't
+    dropped - _masked_axis_projection treats 0 as background. Same crop and
+    framing as _masked_axis_projection."""
+    enc = np.where(mask & np.isfinite(vol), vol + _NAN_MAP_OFFSET, 0).astype(np.float32)
+    return _masked_axis_projection(enc, mask, axis=axis) - _NAN_MAP_OFFSET
+
+
+def _load_time_map(main_dir, outname, stem):
+    """A Time Maps step output (ms, R0/EI grid), or None if it hasn't run."""
+    p = os.path.join(main_dir, outname, "Results", "Maps", f"{stem}.nii.gz")
+    if not os.path.isfile(p):
+        return None
+    return np.asarray(nib.load(p).dataobj, dtype=np.float32)
+
+
+def get_time_map_on_ee_grid(main_dir, outname, stem, PHASE=7, antspath=None):
+    """A Time Maps output resampled from R0's (EI's) grid onto R{PHASE}'s (EE's)
+    grid with the same transforms get_ei_on_ee_grid uses. Nearest-neighbour,
+    on an offset-encoded copy, so lung values never blend with the NaN
+    background. Cached as {stem}_on_EE_grid.nii.gz next to the other EE-grid
+    files and redone whenever the source map is newer. None if the Time Maps
+    step hasn't run."""
+    src_path = os.path.join(main_dir, outname, "Results", "Maps", f"{stem}.nii.gz")
+    if not os.path.isfile(src_path):
+        return None
+    files = _locate_ee_grid_transform_files(main_dir, outname, PHASE=PHASE)
+    out_path = os.path.join(files["out_dir"], f"{stem}_on_EE_grid.nii.gz")
+    if not (os.path.isfile(out_path) and os.path.getmtime(out_path) >= os.path.getmtime(src_path)):
+        antspath = Path(antspath) if antspath else DEFAULT_ANTSPATH
+        src_img = nib.load(src_path)
+        a = np.asarray(src_img.dataobj, dtype=np.float32)
+        enc = np.where(np.isfinite(a), a + _NAN_MAP_OFFSET, 0).astype(np.float32)
+        tmp_path = out_path.replace(".nii.gz", "_encoded_tmp.nii.gz")
+        nib.save(nib.Nifti1Image(enc, src_img.affine, src_img.header), tmp_path)
+        cmd = [
+            str(antspath / "antsApplyTransforms.exe"), "-d", "3",
+            "-r", files["ee_reference_path"],
+            "-i", tmp_path,
+            "-o", out_path,
+            "-n", "NearestNeighbor",
+            "-t", files["warp2"],
+            "-t", files["warp1"],
+            "-t", files["affine"],
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        if result.returncode != 0:
+            raise RuntimeError(f"antsApplyTransforms failed ({stem} onto EE grid):\n{result.stdout}\n{result.stderr}")
+        res_img = nib.load(out_path)
+        d = np.asarray(res_img.dataobj, dtype=np.float32)
+        dec = np.where(d > _NAN_MAP_OFFSET / 2, d - _NAN_MAP_OFFSET, np.nan).astype(np.float32)
+        nib.save(nib.Nifti1Image(dec, res_img.affine, res_img.header), out_path)
+    return np.asarray(nib.load(out_path).dataobj, dtype=np.float32)
+
+
+def _time_map_panel(vol, mask, axis, which):
+    """(title, 2D projection, vmin, vmax) panel entry for a Time Maps output."""
+    title, _, (vmin, vmax) = PANEL_TIME_MAPS[which]
+    return (title, _nan_map_projection(vol, mask, axis), vmin, vmax)
 
 
 def _render_maps_panel(panels, out_path, title, plane="coronal"):
@@ -962,8 +1039,8 @@ def _render_maps_panel(panels, out_path, title, plane="coronal"):
 
 def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", overwrite=False):
     """
-    One combined image, single `plane` projection per map (FRC, TLC, TV, FV,
-    J), everything expressed on R{fix_phase}'s (EI's, R0 in practice) own
+    One combined image, single `plane` projection per map (HU, FRC,
+    Expansion time, TV, FV, J, Tau), everything expressed on R{fix_phase}'s (EI's, R0 in practice) own
     grid - the direction yi2.sh's own Warped.nii.gz/Jacobian.nii.gz come in,
     so no resampling needed here (see get_maps_single_slice_panel_ee for the
     EE-anchored counterpart, which does need an extra resampling step). Uses
@@ -998,8 +1075,13 @@ def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", 
         # map's theoretical 0-1 bound - stretching the colormap over range
         # the data never reaches makes the whole panel look nearly flat.
         ("FRC", _masked_axis_projection(ee_on_ei_img / -1000, ei_mask, axis=axis), 0, 0.8),
-        ("TLC", _masked_axis_projection(ei_own_img / -1000, ei_mask, axis=axis), 0, 0.9),
     ]
+    # Expansion time (Time Maps step, first-harmonic phase) replaces TLC here;
+    # Tau is added before Deformation. Both are already on this grid and are
+    # skipped until that step has run.
+    ei_time_maps = {k: _load_time_map(main_dir, outname, spec[1]) for k, spec in PANEL_TIME_MAPS.items()}
+    if ei_time_maps["expansion"] is not None:
+        panels.append(_time_map_panel(ei_time_maps["expansion"], ei_mask, axis, "expansion"))
 
     # TV/FV/J computed voxel-wise in 3D first, THEN collapsed to 2D by
     # averaging - see get_maps_single_slice_panel_ee's longer comment on why
@@ -1030,6 +1112,8 @@ def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", 
     # Whole-lung displacement arrows, on EI's own grid: TotalWarp.nii.gz
     # points EI->EE (see _locate_analysis_maps_files), the EI-grid analogue
     # of the Forward.nii.gz field the EE panel uses.
+    if ei_time_maps["tau"] is not None:
+        panels.append(_time_map_panel(ei_time_maps["tau"], ei_mask, axis, "tau"))
     total_warp = np.asarray(nib.load(files["total_warp_path"]).dataobj).squeeze()
     panels.append(("Deformation", (total_warp, ei_mask, ei_mask_nii.affine), 0.0, 5.0))
 
@@ -1096,7 +1180,12 @@ def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", 
     ee_own_img = gaussian_filter(nib.load(ee_grid_files["ee_reference_path"]).get_fdata(), 1)
     jac_on_ee = gaussian_filter(nib.load(ee_grid_files["jac_on_ee_path"]).get_fdata(), 1)  # native EE->EI, >1
 
-    panels.append(("TLC", _masked_axis_projection(ei_on_ee_img / -1000, ee_mask, axis=axis), 0, 0.9))
+    # Expansion time (Time Maps step, resampled onto this grid) replaces TLC
+    # here; Tau is added before Deformation. Skipped until that step has run.
+    ee_time_maps = {k: get_time_map_on_ee_grid(main_dir, outname, spec[1], PHASE=PHASE)
+                    for k, spec in PANEL_TIME_MAPS.items()}
+    if ee_time_maps["expansion"] is not None:
+        panels.append(_time_map_panel(ee_time_maps["expansion"], ee_mask, axis, "expansion"))
 
     ei_masked = _mask_bbox_crop(ei_on_ee_img, ee_mask)
     ee_masked = _mask_bbox_crop(ee_own_img, ee_mask)
@@ -1136,6 +1225,8 @@ def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", 
     # points EE->EI (see _locate_diaphragm_warp_and_mask), the same field
     # the diaphragm step's whole-lung arrows already use.
     forward_warp_path, _, _, _ = _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE)
+    if ee_time_maps["tau"] is not None:
+        panels.append(_time_map_panel(ee_time_maps["tau"], ee_mask, axis, "tau"))
     forward_warp = np.asarray(nib.load(forward_warp_path).dataobj).squeeze()
     panels.append(("Deformation", (forward_warp, ee_mask, ee_mask_nii.affine), 0.0, 5.0))
 
@@ -1199,7 +1290,7 @@ def build_rat_coronal_maps_panel(rat_dir, outname, frame="EI"):
     """
     Stacks every session's own coronal functional-maps panel
     (maps_panel_{frame}_coronal.jpg from get_maps_single_slice_panel_ei/_ee
-    - FRC, TLC, TV, FV, J, Deformation columns) into one combined image
+    - HU, FRC, Expansion time, TV, FV, J, Tau, Deformation columns) into one combined image
     under <rat_dir>/Analysis, one row per session in chronological order
     (top = earliest/first timepoint, same ordering as
     get_rat_session_dirs) - lets you see how each functional map changes
@@ -2244,6 +2335,478 @@ def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
 
 BASE_OUTNAME = 'Optimized_Reconstruction-MI'
 FALLBACK_OUTNAME = BASE_OUTNAME + '_fallback'
+# ---------------------------------------------------------------------------
+# Time maps: EI time, inspiratory arrival time, expiratory tau
+# ---------------------------------------------------------------------------
+# Needs "Register All Phases" (every R{k}_to_R0 Jacobian). Everything is on
+# R0's (EI's) own grid: J_k(x) is voxel x's volume at phase k relative to
+# EI, so J_0 = 1 and the 16 values trace each voxel's volume over one
+# breathing cycle. Phase k's time in the cycle is its clustering centroid
+# (real_time.npy, fraction of the cycle) times the period (60 / br.npy).
+
+TIME_MAPS_MIN_AMPLITUDE = 0.02   # voxels whose volume swings < 2% get NaN (timing is noise there)
+TIME_MAPS_ARRIVAL_LEVEL = 0.5    # arrival = reaching 50% of own inspiratory expansion
+TIME_MAPS_FOURIER_CANDIDATES = (2, 3, 4, 5, 6)  # harmonics tried; chosen per session by leave-one-out error
+TIME_MAPS_TAU_GRID = np.geomspace(0.02, 2.0, 200)  # seconds; tau candidates for the exponential fit
+TIME_MAP_SPECS = [
+    # key, NIfTI stem, panel title, colormap, 6-slice PNG stem, fixed display range (ms)
+    ("ei_time", "time_EI_ms", "EI time (ms)", "coolwarm", "EI_time", (-50.0, 50.0)),
+    ("arrival", "arrival_time_ms", "Arrival (ms)", "coolwarm", "arrival_time", (-50.0, 50.0)),
+    ("tau", "tau_ms", "Tau (ms)", "cividis", "tau", (50.0, 200.0)),  # ~5-95th pct on real data
+    # First-harmonic phase, shown as "Expansion time" (red-blue like the other relative-time maps).
+    ("h1_phase", "expansion_time_ms", "Expansion time (ms)", "coolwarm", "expansion_time", (-50.0, 50.0)),
+]
+
+
+def _time_map_six_slices(vol, num_slices=6, smooth=False):
+    """Same 6-slice coronal layout as FRC.png / FRC_smoothed.png
+    (utils.get_x_slices_from_image with coronal_axis=1): the centre slice of
+    each of 6 equal slabs, or with smooth=True the slab average. NaN-aware,
+    since 0 is a valid time here (the utils helper treats 0 as missing)."""
+    import warnings
+    n = vol.shape[1]
+    size = int(n / num_slices)
+    out = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for i in range(num_slices):
+            s, e = i * size, (i + 1) * size
+            out.append(np.nanmean(vol[:, s:e, :], axis=1) if smooth else vol[:, s + (e - s) // 2, :])
+    return np.stack(out).astype(np.float32)
+
+
+def _fourier_design(t, period, n_harmonics):
+    """Columns [1, cos(w t), sin(w t), ..., cos(K w t), sin(K w t)], w = 2 pi / period."""
+    w = 2 * np.pi * np.asarray(t, dtype=np.float64) / period
+    cols = [np.ones_like(w)]
+    for k in range(1, n_harmonics + 1):
+        cols += [np.cos(k * w), np.sin(k * w)]
+    return np.stack(cols, axis=1)
+
+
+def _choose_fourier_harmonics(V, times, period, candidates=TIME_MAPS_FOURIER_CANDIDATES,
+                              n_sample=200000, seed=0):
+    """Number of harmonics minimizing the median leave-one-out error of the
+    least-squares Fourier fit (exact LOO residual e_i / (1 - h_ii) from the
+    hat matrix, shared by every voxel since they share sample times).
+    Returns (K, {K: median LOO RMS})."""
+    rng = np.random.default_rng(seed)
+    sub = V if len(V) <= n_sample else V[rng.choice(len(V), n_sample, replace=False)]
+    scores = {}
+    for K in candidates:
+        X = _fourier_design(times, period, K)
+        if X.shape[1] >= len(times):
+            continue
+        H = X @ np.linalg.pinv(X)
+        h = np.diag(H)
+        loo = (sub - sub @ H.T) / (1 - h)
+        scores[K] = float(np.median(np.sqrt((loo ** 2).mean(axis=1))))
+    return min(scores, key=scores.get), scores
+
+
+def _fit_expiratory_tau(Y, t, tau_grid):
+    """Least-squares fit of y(t) = c + a * exp(-(t - t[0]) / tau), a > 0, for
+    every row of Y (N, L) sampled at shared times t (L,). For a fixed tau the
+    model is linear in (c, a), so the residual for all voxels is one hat-
+    matrix product per candidate tau; the best tau on the log-spaced grid is
+    refined with a parabola in log(tau). Returns (tau, r2, at_grid_edge)."""
+    t = np.asarray(t, dtype=np.float64) - t[0]
+    n, L = Y.shape
+    sse = np.empty((n, len(tau_grid)))
+    for i, tau in enumerate(tau_grid):
+        X = np.stack([np.ones(L), np.exp(-t / tau)], axis=1)
+        H = X @ np.linalg.pinv(X)
+        R = Y - Y @ H.T
+        sse[:, i] = (R ** 2).sum(axis=1)
+    j = np.argmin(sse, axis=1)
+    edge = (j == 0) | (j == len(tau_grid) - 1)
+    jj = np.clip(j, 1, len(tau_grid) - 2)
+    r = np.arange(n)
+    s0, s1, s2 = sse[r, jj - 1], sse[r, jj], sse[r, jj + 1]
+    lg = np.log(tau_grid)
+    step = lg[1] - lg[0]
+    den = s0 - 2 * s1 + s2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        off = np.where(den > 0, 0.5 * (s0 - s2) / den, 0.0)
+    off = np.clip(off, -0.5, 0.5)
+    tau = np.exp(lg[jj] + off * step)
+    tau = np.where(edge, tau_grid[j], tau)
+    # sign of the decaying term at the chosen tau (must be emptying: a > 0)
+    e = np.exp(-t[None, :] / tau[:, None])
+    em, ym = e.mean(axis=1), Y.mean(axis=1)
+    cov = ((e - em[:, None]) * (Y - ym[:, None])).sum(axis=1)
+    var = ((e - em[:, None]) ** 2).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        a = cov / var
+        c = ym - a * em
+        res = Y - (c[:, None] + a[:, None] * e)
+        sst = ((Y - ym[:, None]) ** 2).sum(axis=1)
+        r2 = 1 - (res ** 2).sum(axis=1) / sst
+    tau = np.where(a > 0, tau, np.nan)
+    return tau, r2, edge
+
+
+def _time_maps_from_curves(V, times, period, k_ee, dt=0.001, chunk=20000):
+    """V: (N, P) volume curves (phase 0 = EI = 1) sampled at `times` (P,)
+    seconds in [0, period). The whole-lung mean curve is appended as the last
+    row so it goes through exactly the same math as every voxel.
+
+    EI time and arrival: each curve is fitted by least squares with a
+    periodic Fourier series (harmonic count chosen by leave-one-out error),
+    evaluated on a `dt` grid, and timing is read off that smooth fit.
+    Tau: exponential fit c + a*exp(-t/tau) to the expiratory samples, phase 0
+    (EI) through the whole-lung end-expiration phase k_ee.
+
+    Returns (maps in seconds, whole-lung reference seconds, whole-lung
+    amplitude, valid mask, fit info dict)."""
+    g = V.mean(axis=0, keepdims=True)
+    Vg = np.vstack([V, g])
+    n = Vg.shape[0]
+    K, loo_scores = _choose_fourier_harmonics(V, times, period)
+    A = _fourier_design(times, period, K)
+    coef = Vg @ np.linalg.pinv(A).T                       # (n, 2K+1)
+    # First-harmonic phase: a1*cos(wt) + b1*sin(wt) = R*cos(w(t - t_h1)),
+    # t_h1 = atan2(b1, a1) / w - the time the fundamental peaks.
+    t_h1 = (np.arctan2(coef[:, 2], coef[:, 1]) * period / (2 * np.pi)) % period
+    G = int(round(period / dt))
+    t_start = float(np.min(times))
+    tg = t_start + np.arange(G) * (period / G)
+    step = period / G
+    B = _fourier_design(tg, period, K).astype(np.float32)  # (G, 2K+1)
+    lvl_arr = TIME_MAPS_ARRIVAL_LEVEL
+
+    t_peak = np.empty(n); t_arr = np.empty(n); amp = np.empty(n)
+    cols = np.arange(G)
+    for s in range(0, n, chunk):
+        f = coef[s:s + chunk].astype(np.float32) @ B.T     # (m, G)
+        m = f.shape[0]
+        r = np.arange(m)[:, None]
+        imax, imin = f.argmax(axis=1), f.argmin(axis=1)
+        vmax, vmin = f[np.arange(m), imax], f[np.arange(m), imin]
+        a = vmax - vmin
+        with np.errstate(invalid="ignore", divide="ignore"):
+            nf = (f - vmin[:, None]) / a[:, None]
+        t_peak[s:s + m] = tg[imax]
+        # arrival: from the fitted curve's own trough, first upward crossing of 50%
+        rolled = nf[r, (imin[:, None] + cols) % G]
+        j = np.maximum(np.argmax(rolled >= lvl_arr, axis=1), 1)
+        n0, n1 = rolled[np.arange(m), j - 1], rolled[np.arange(m), j]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fr = np.clip((lvl_arr - n0) / (n1 - n0), 0, 1)
+        t_arr[s:s + m] = tg[imin] + (j - 1 + fr) * step
+        amp[s:s + m] = a
+
+    # Tau: exponential fit on the expiratory samples (phase-time order).
+    exp_phases = np.argsort(times)[: int(np.searchsorted(np.sort(times), times[k_ee])) + 1]
+    tau = np.empty(n); r2 = np.empty(n); edge = np.empty(n, dtype=bool)
+    for s in range(0, n, chunk * 5):
+        tau[s:s + chunk * 5], r2[s:s + chunk * 5], edge[s:s + chunk * 5] = _fit_expiratory_tau(
+            Vg[s:s + chunk * 5][:, exp_phases], times[exp_phases], TIME_MAPS_TAU_GRID)
+
+    def _wrap(d):  # circular difference into (-period/2, period/2]
+        return (d + period / 2) % period - period / 2
+
+    valid = amp >= TIME_MAPS_MIN_AMPLITUDE
+    out, ref = {}, {}
+    for key, val, relative in (("ei_time", t_peak, True), ("arrival", t_arr, True), ("tau", tau, False),
+                               ("h1_phase", t_h1, True)):
+        glob = float(val[-1])
+        vox = val[:-1].astype(np.float64)
+        if relative:
+            vox = _wrap(vox - glob)  # + = later than the whole lung
+            glob = (float(_wrap(glob)) if key in ("ei_time", "h1_phase")
+                    else float((glob - t_start) % period + t_start))
+        else:
+            vox = np.where(edge[:-1], np.nan, vox)  # tau pinned at the grid edge = not determined
+        out[key] = np.where(valid[:-1], vox, np.nan)
+        ref[key] = glob
+    vr2 = r2[:-1][valid[:-1] & np.isfinite(r2[:-1])]
+    info = {
+        "fourier_harmonics": int(K),
+        "fourier_loo_rms_by_harmonics": {str(k): v for k, v in loo_scores.items()},
+        "fourier_fit_rms_median": float(np.median(np.sqrt(((V - coef[:-1] @ A.T) ** 2).mean(axis=1)))),
+        "tau_fit_phases": [int(p) for p in exp_phases],
+        "tau_grid_ms": [float(TIME_MAPS_TAU_GRID[0] * 1000), float(TIME_MAPS_TAU_GRID[-1] * 1000)],
+        "tau_fit_r2_median": float(np.median(vr2)) if vr2.size else None,
+        "tau_fit_r2_p5": float(np.percentile(vr2, 5)) if vr2.size else None,
+        "tau_at_grid_edge_voxels": int(edge[:-1].sum()),
+        "tau_not_decaying_voxels": int(np.isnan(tau[:-1]).sum()),
+        "whole_lung_tau_r2": float(r2[-1]),
+    }
+    return out, ref, float(amp[-1]), valid[:-1], info
+
+
+def _locate_all_phase_jacobians(main_dir, outname):
+    """{phase k: path of R{k}->R{fix} Jacobian} for every registered phase,
+    plus fix_phase. Same direction-tag check as _locate_analysis_maps_files."""
+    reg_dir = os.path.join(main_dir, outname, "Results", "Registered")
+    if not os.path.isdir(reg_dir):
+        raise FileNotFoundError(f"No registration found in {reg_dir} - run Register All Phases first.")
+    jacs, fix = {}, None
+    for d in sorted(os.listdir(reg_dir)):
+        full = os.path.join(reg_dir, d)
+        if not (os.path.isdir(full) and d.startswith("R") and "_to_R" in d):
+            continue
+        k, f = d[1:].split("_to_R")
+        if not (k.isdigit() and f.isdigit()):
+            continue
+        k, f = int(k), int(f)
+        fix = f if fix is None else fix
+        if f != fix:
+            continue
+        tag = f"R{k}_To_"
+        hits = [x for x in os.listdir(full) if tag in x and "_Jacobian.nii" in x]
+        if hits:
+            jacs[k] = os.path.join(full, hits[0])
+    return jacs, fix
+
+
+def get_time_maps(main_dir, outname, overwrite=False):
+    """
+    Per-voxel breathing-timing maps on R0's (EI's) grid, from the Jacobians
+    of every phase registered onto R0 (Register All Phases):
+
+      EI time (ms)      when the voxel reaches its own maximum volume, relative
+                        to when the whole lung does (+ = later). Sub-phase
+                        precision via a parabola through the peak phase and
+                        its neighbours.
+      Arrival (ms)      when the voxel reaches 50% of its own inspiratory
+                        expansion, relative to when the whole lung does
+                        (+ = fills later).
+      Expansion time    (ms) phase of the Fourier fit's first harmonic, as the time
+                        the fundamental peaks, relative to the whole lung
+                        (+ = later; the full cycle, 360 deg, = one period).
+      Tau (ms)          expiratory time constant from a least-squares fit of
+                        c + a*exp(-t/tau) to the expiratory phases (phase 0
+                        through the whole-lung end-expiration phase).
+
+    EI time and arrival are read off a least-squares periodic Fourier fit of
+    each voxel's 16-phase volume curve (harmonic count chosen per session by
+    leave-one-out error), evaluated on a 1 ms grid.
+
+    Voxels whose volume changes by less than 2% over the cycle are NaN.
+    Writes Results/Maps/{time_EI_ms,arrival_time_ms,tau_ms}.nii.gz,
+    maps_panel_time_{coronal,sagittal,axial}.jpg, time_maps_summary.png and
+    time_maps_summary.json. Returns the list of written paths.
+    """
+    import json
+    import warnings
+    results_dir = os.path.join(main_dir, outname, "Results")
+    maps_dir = os.path.join(results_dir, "Maps")
+    os.makedirs(maps_dir, exist_ok=True)
+    summary_json = os.path.join(maps_dir, "time_maps_summary.json")
+    if not overwrite and os.path.isfile(summary_json):
+        print(f"Time maps already exist ({summary_json}) - pass overwrite=True to redo.")
+        return [summary_json]
+
+    # --- phase times -------------------------------------------------------
+    out_root = os.path.join(main_dir, outname)
+    rt_path, br_path = os.path.join(out_root, "real_time.npy"), os.path.join(out_root, "br.npy")
+    if not (os.path.isfile(rt_path) and os.path.isfile(br_path)):
+        raise FileNotFoundError(f"Need {rt_path} and {br_path} (written by Reconstruction) for the phase times.")
+    frac = np.asarray(np.load(rt_path), dtype=np.float64).ravel()
+    br = float(np.asarray(np.load(br_path)).ravel()[0])
+    period = 60.0 / br
+    n_phases = len(frac)
+    frac = np.where(frac < 0, frac + 1.0, frac)  # phase 0 stored slightly negative when it sits just before t=1
+    times = frac * period
+    order_ok = np.all(np.diff(times[1:]) > 0) and (times[0] < times[1] or times[0] > times[-1])
+    if not order_ok:
+        raise ValueError(f"Phase times in {rt_path} are not in phase order: {np.round(frac, 3)}")
+
+    # --- Jacobians ---------------------------------------------------------
+    jacs, fix = _locate_all_phase_jacobians(main_dir, outname)
+    if fix != 0:
+        raise ValueError(f"Time maps need every phase registered onto R0 (found reference R{fix}).")
+    missing = [k for k in range(1, n_phases) if k not in jacs]
+    if missing:
+        raise FileNotFoundError(f"Missing R{{k}}_to_R0 Jacobian for phase(s) {missing} - run Register All Phases.")
+
+    mask_path = [os.path.join(results_dir, x) for x in os.listdir(results_dir) if "R0_m.nii" in x]
+    if not mask_path:
+        raise FileNotFoundError(f"No R0 mask (*R0_m.nii*) in {results_dir}")
+    mask_nii = nib.load(mask_path[0])
+    mask = np.asarray(mask_nii.dataobj) > 0
+    # Work inside the mask's bounding box (+ pad for the smoothing kernel).
+    pad = 4
+    lo = [max(int(np.where(mask.any(axis=tuple(a for a in range(3) if a != ax)))[0].min()) - pad, 0) for ax in range(3)]
+    hi = [min(int(np.where(mask.any(axis=tuple(a for a in range(3) if a != ax)))[0].max()) + pad + 1, mask.shape[ax]) for ax in range(3)]
+    box = tuple(slice(l, h) for l, h in zip(lo, hi))
+    mbox = mask[box]
+    n_vox = int(mbox.sum())
+    print(f"Time maps: {n_vox} lung voxels, {n_phases} phases, period {period * 1000:.0f} ms", flush=True)
+
+    V = np.ones((n_vox, n_phases), dtype=np.float32)  # phase 0 = EI reference, J = 1
+    for k in range(1, n_phases):
+        t0 = time.time()
+        jac = np.asarray(nib.load(jacs[k]).dataobj[box], dtype=np.float32)
+        if jac.ndim > 3:
+            jac = jac.reshape(jac.shape[:3])
+        # Same sigma-1 smoothing the other Jacobian-based maps (J/TV/FV) use.
+        V[:, k] = gaussian_filter(jac, 1)[mbox]
+        print(f"  loaded R{k}_to_R0 Jacobian ({time.time() - t0:.0f} s)", flush=True)
+
+    g = V.mean(axis=0)
+    k_ee = int(np.argmin(g))
+    # Sanity check: the whole-lung volume curve should track the breathing
+    # signal's amplitude at each phase if labels and times line up.
+    ra_path = os.path.join(out_root, "real_amps.npy")
+    amp_corr = None
+    if os.path.isfile(ra_path):
+        ra = np.asarray(np.load(ra_path), dtype=np.float64).ravel()
+        if len(ra) == n_phases:
+            amp_corr = float(np.corrcoef(ra, g)[0, 1])
+            if amp_corr < 0.8:
+                print(f"WARNING: whole-lung volume vs breathing amplitude correlation is only {amp_corr:.2f} - "
+                      "phase labels and phase times may not line up for this session.", flush=True)
+
+    maps_s, ref_s, g_amp, valid, fit_info = _time_maps_from_curves(V.astype(np.float64), times, period, k_ee)
+    print(f"  Fourier fit: {fit_info['fourier_harmonics']} harmonics; tau fit median R^2 "
+          f"{fit_info['tau_fit_r2_median']:.3f}", flush=True)
+
+    # --- write NIfTI + panels ---------------------------------------------
+    written = []
+    maps_ms = {}
+    for key, stem, _, _, _, _ in TIME_MAP_SPECS:
+        vol = np.full(mask.shape, np.nan, dtype=np.float32)
+        sub = np.full(mbox.shape, np.nan, dtype=np.float32)
+        sub[mbox] = maps_s[key] * 1000.0
+        vol[box] = sub
+        maps_ms[key] = sub
+        img = nib.Nifti1Image(vol, mask_nii.affine, mask_nii.header)
+        img.set_data_dtype(np.float32)
+        path = os.path.join(maps_dir, f"{stem}.nii.gz")
+        nib.save(img, path)
+        written.append(path)
+
+    # Fixed display ranges (like every other map here) so sessions and rats
+    # stay comparable.
+    limits = {spec[0]: spec[5] for spec in TIME_MAP_SPECS}
+
+    def _limits(key):
+        return limits[key]
+
+    # 6-slice images, same layout as FRC.png / FRC_smoothed.png.
+    for key, _, _, cmap, png_stem, (vmin, vmax) in TIME_MAP_SPECS:
+        for smooth in (False, True):
+            path = os.path.join(maps_dir, f"{png_stem}{'_smoothed' if smooth else ''}.png")
+            save_image_MI_style(_time_map_six_slices(maps_ms[key], smooth=smooth), vmin, vmax, path, 300, cmap=cmap)
+            written.append(path)
+
+    for plane, axis in MAPS_PLANE_AXIS.items():
+        fig, axes = plt.subplots(1, len(TIME_MAP_SPECS), figsize=(4 * len(TIME_MAP_SPECS), 5), dpi=200, facecolor="black")
+        for ax, (key, _, title, cmap, _, _) in zip(axes, TIME_MAP_SPECS):
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                proj = np.nanmean(maps_ms[key], axis=axis)
+            vmin, vmax = _limits(key)
+            im = ax.imshow(proj.T, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_facecolor("black")
+            ax.axis("off")
+            ax.set_title(title, color="white", fontsize=18)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(cbar.ax.get_yticklabels(), color="white")
+        fig.suptitle(f"R0 (EI) breathing-timing maps - mean {plane} projection", color="white", fontsize=16)
+        path = os.path.join(maps_dir, f"maps_panel_time_{plane}.jpg")
+        plt.savefig(path, bbox_inches="tight", dpi=200, facecolor="black")
+        plt.close(fig)
+        written.append(path)
+        log_artifact(path)
+
+    # Summary figure: whole-lung volume curve + distribution of each map.
+    fig, axes = plt.subplots(1, 1 + len(TIME_MAP_SPECS), figsize=(5 * (1 + len(TIME_MAP_SPECS)), 4.2))
+    tt = np.concatenate([times, [times[0] + period]]) * 1000
+    gg = np.concatenate([g, [g[0]]])
+    axes[0].plot(tt, gg, "k-o", ms=4)
+    for k in range(n_phases):
+        axes[0].annotate(str(k), (times[k] * 1000, g[k]), textcoords="offset points", xytext=(0, 6),
+                         ha="center", fontsize=7)
+    axes[0].axvline(ref_s["ei_time"] * 1000,
+                    color="tab:red", ls="--", lw=1, label="lung EI")
+    axes[0].axvline(ref_s["arrival"] * 1000, color="tab:blue", ls="--", lw=1, label="lung 50% arrival")
+    axes[0].set_xlabel("time in cycle (ms)"); axes[0].set_ylabel("mean J (volume rel. to EI)")
+    axes[0].set_title("Whole-lung volume over the cycle"); axes[0].legend(fontsize=8)
+    for ax, (key, _, title, cmap, _, _) in zip(axes[1:], TIME_MAP_SPECS):
+        vals = maps_s[key][np.isfinite(maps_s[key])] * 1000.0
+        lo_, hi_ = _limits(key)
+        ax.hist(vals, bins=120, range=(lo_ - 0.1 * abs(hi_ - lo_), hi_ + 0.1 * abs(hi_ - lo_)), color="0.4")
+        ax.axvline(np.median(vals), color="k", lw=1)
+        ax.set_title(f"{title}  median {np.median(vals):.0f}")
+        ax.set_xlabel("ms"); ax.set_yticks([])
+    plt.tight_layout()
+    path = os.path.join(maps_dir, "time_maps_summary.png")
+    plt.savefig(path, dpi=150)
+    plt.close(fig)
+    written.append(path)
+    log_artifact(path)
+
+    def _stats(key):
+        vals = maps_s[key][np.isfinite(maps_s[key])] * 1000.0
+        if vals.size == 0:
+            return {"n_voxels": 0}
+        q = np.percentile(vals, [5, 25, 50, 75, 95])
+        return {"n_voxels": int(vals.size), "mean": float(vals.mean()), "std": float(vals.std()),
+                "p5": q[0], "p25": q[1], "median": q[2], "p75": q[3], "p95": q[4]}
+
+    summary = {
+        "definitions": {
+            "ei_time_ms": "voxel's own peak-volume time minus the whole lung's peak-volume time (+ = later)",
+            "arrival_time_ms": f"time voxel reaches {TIME_MAPS_ARRIVAL_LEVEL:.0%} of its own inspiratory expansion "
+                               "minus the same for the whole lung (+ = fills later)",
+            "tau_ms": "expiratory time constant: least-squares fit of c + a*exp(-t/tau), a > 0, to the "
+                      "expiratory phases (phase 0 to the whole-lung EE phase); NaN if not decaying or "
+                      "pinned at the tau search range edge",
+            "expansion_time_ms": "phase of the Fourier fit's first harmonic, expressed as the time the fundamental "
+                           "peaks, minus the same for the whole lung (+ = later; 360 deg = one period)",
+            "timing_curve": "EI time and arrival are read off a least-squares periodic Fourier fit of each "
+                            "voxel's volume curve, evaluated on a 1 ms grid",
+            "volume_curve": "J_k = Jacobian of R_k -> R0 registration on R0's grid (R0 = EI, J_0 = 1), sigma-1 smoothed",
+            "excluded": f"voxels whose volume changes by < {TIME_MAPS_MIN_AMPLITUDE:.0%} over the cycle",
+        },
+        "breathing_rate_bpm": br,
+        "period_ms": period * 1000,
+        "phase_times_ms": [float(x) for x in times * 1000],
+        "whole_lung_mean_J_per_phase": [float(x) for x in g],
+        "whole_lung_ee_phase": k_ee,
+        "whole_lung_tidal_J_amplitude": g_amp,
+        "whole_lung_reference_ms": {
+            "ei_time": ref_s["ei_time"] * 1000,
+            "arrival_50pct": ref_s["arrival"] * 1000,
+            "tau": ref_s["tau"] * 1000,
+            "h1_phase": ref_s["h1_phase"] * 1000,
+        },
+        "volume_vs_breathing_amplitude_corr": amp_corr,
+        "fits": fit_info,
+        "lung_voxels": n_vox,
+        "valid_voxels": int(valid.sum()),
+        "maps_ms": {stem: _stats(key) for key, stem, _, _, _, _ in TIME_MAP_SPECS},
+    }
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    written.append(summary_json)
+    for key, stem, title, _, _, _ in TIME_MAP_SPECS:
+        s = summary["maps_ms"][stem]
+        if s.get("n_voxels"):
+            print(f"  {title:14s} median {s['median']:7.1f}  IQR {s['p25']:7.1f} .. {s['p75']:7.1f}", flush=True)
+
+    # The functional-map panels and maps.png show the arrival map as a
+    # column/row, so refresh them now that it exists (they are otherwise
+    # built by Analysis, which may have run before this step).
+    try:
+        for p in get_maps_all_slice_panels(main_dir, outname, overwrite=True).values():
+            written.append(p)
+            log_artifact(p)
+    except Exception as e:
+        print(f"  (Map panels not refreshed with the arrival map: {e})", flush=True)
+    save_combined_maps_figure(maps_dir)
+    return written
+
+
+def time_maps_step(main_dir, outname, overwrite=True):
+    return get_time_maps(main_dir, outname, overwrite=overwrite)
+
+
 outname = BASE_OUTNAME  # current effective output-folder name for this process - see resolve_outname()
 # --------------------------------------------------------------------------
 # End of code copied from the notebook.
@@ -2414,6 +2977,16 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
             log_failed("volume_analysis", e)
             return 1
         _step_done(main_dir, "volume_analysis")
+
+    if "time_maps" in steps:
+        log_step("time_maps")
+        try:
+            for p in time_maps_step(main_dir, outname):
+                log_artifact(p)
+        except Exception as e:
+            log_failed("time_maps", e)
+            return 1
+        _step_done(main_dir, "time_maps")
 
     if announce_done:
         print("\n===ALL_DONE===", flush=True)
