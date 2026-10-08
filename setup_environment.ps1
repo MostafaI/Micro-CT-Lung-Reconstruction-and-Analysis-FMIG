@@ -61,7 +61,7 @@ $GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 $GENERAL_PACKAGES = @(
     "pillow", "dicom2nifti", "imageio", "matplotlib", "nibabel", "numba",
     "numpy", "pandas", "plotly", "pydicom", "scipy", "scikit-learn",
-    "seaborn", "tqdm"
+    "seaborn", "tifffile", "tqdm"
 )
 
 # Packages for the RTK/recon env. itk + itk-rtk are installed separately
@@ -345,7 +345,7 @@ function Test-GeneralEnv($pythonExe) {
     # fmig_rat_app.py's desktop GUI needs it; pipeline_driver.py (run
     # directly) and everything else work without it. See Add-TkinterSupport.
     $code = @"
-import numpy, scipy, pandas, matplotlib, nibabel, pydicom, dicom2nifti, sklearn, seaborn, plotly, numba, tqdm, torch
+import numpy, scipy, pandas, matplotlib, nibabel, pydicom, dicom2nifti, sklearn, seaborn, plotly, numba, tifffile, tqdm, torch
 from PIL import Image
 try:
     import tkinter

@@ -79,6 +79,7 @@ from Analysis import *
 from utils import *
 from segment_from_projections import find_lungs
 from fmig_version import get_code_version, record_code_version
+import raw_correction
 import subprocess as _subprocess  # keep builtin 'subprocess' import below too
 
 import subprocess
@@ -89,14 +90,44 @@ import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 
 
+# Written next to ct-data/corr when corr was built from the raw chunks with
+# the dead-pixel fix already applied, so step_2 knows not to run it again.
+CORR_FROM_RAW_MARKER = 'corr_from_raw.json'
+
+
 def step_2(main_dir):
-    folder1 = os.path.join(main_dir, 'ct-data', 'corr')
-    corr_dir = os.path.join(main_dir, 'ct-data', 'corr')
-    folder2 = os.path.join(main_dir, 'ct-data', 'corr_new')
-    if not os.path.isdir(folder2):
-        os.mkdir(folder2)
+    """Produces the final ct-data/corr the reconstruction reads: dark/white-
+    field corrected projections with 0-valued dead pixels filled in.
+
+    - ct-data/corr missing but raw Chunk*.tif + calibration/ present: both
+      corrections are done in one pass straight from the raw chunks
+      (raw_correction.correct_ct_data(fix_dead=True)).
+    - ct-data/corr already there (from the MILabs software): only the
+      dead-pixel pass runs (correct_corr_dir), as before - original kept as
+      corr_old until clean_study_folder removes it.
+    """
+    ct_data_dir = os.path.join(main_dir, 'ct-data')
+    folder1 = os.path.join(ct_data_dir, 'corr')
+    marker = os.path.join(ct_data_dir, CORR_FROM_RAW_MARKER)
     t = time.time()
-    if not os.path.isdir(folder1 + '_old'):
+    corr_exists = os.path.isdir(folder1) and len(os.listdir(folder1)) > 0
+    if not corr_exists:
+        if not raw_correction.has_raw_data(ct_data_dir):
+            raise FileNotFoundError(f"{folder1} is missing and there are no raw Chunk*.tif files "
+                                    f"+ calibration/ folder to build it from")
+        print("Building ct-data/corr from the raw chunks (flat-field + dead-pixel correction) ...",
+              flush=True)
+        raw_correction.correct_ct_data(ct_data_dir, output_dir=folder1, fix_dead=True)
+        with open(marker, 'w') as f:
+            json.dump({"source": "raw Chunk*.tif", "dead_pixel_fix": True,
+                       "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "code_version": get_code_version()}, f, indent=2)
+    elif os.path.isfile(marker):
+        print("ct-data/corr was built from the raw chunks - dead pixels already corrected.")
+    elif not os.path.isdir(folder1 + '_old'):
+        folder2 = os.path.join(ct_data_dir, 'corr_new')
+        if not os.path.isdir(folder2):
+            os.mkdir(folder2)
         correct_corr_dir(folder1, out_dir=folder2)
         if os.path.exists(folder2):
             os.rename(folder1, folder1 + '_old')

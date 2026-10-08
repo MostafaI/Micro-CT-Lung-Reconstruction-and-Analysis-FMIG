@@ -177,7 +177,7 @@ if RTKRECON_DIR not in sys.path:
     sys.path.insert(0, RTKRECON_DIR)
 
 STEPS = [
-    ("recon", "1. Reconstruction  (correct projections, breathing-gated recon)"),
+    ("recon", "1. Reconstruction  (correct projections - from raw chunks if ct-data/corr is missing - and breathing-gated recon)"),
     ("segment", "2. Segment  (compress, lung segmentation, cropped GIF)"),
     ("segment_lr", "3. Segment Left/Right lungs  (fix L/R split, save mLR masks, needs Segment)"),
     ("analysis", "4. Analysis  (FRC/TLC maps; also generates TV/FV/J maps if Register has already run)"),
