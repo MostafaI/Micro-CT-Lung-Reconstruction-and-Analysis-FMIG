@@ -968,15 +968,15 @@ MAP_COLORMAPS = {
     "TV": "viridis",
     "FV": "hot",
     "J": "magma",
-    "Expansion time": "coolwarm",  # first-harmonic phase (Time Maps step): blue = earlier, red = later
-    "Tau": "cividis",  # expiratory time constant (Time Maps step)
+    "Arrival": "coolwarm",  # 50% inspiratory time (Time Maps step): blue = earlier, red = later
+    "Tau": "plasma",  # expiratory time constant (Time Maps step); TLC's old colormap
 }
 
 
 # Time Maps step outputs shown in the functional-map panels:
 # (panel title, NIfTI stem in Results/Maps, fixed display range).
 PANEL_TIME_MAPS = {
-    "expansion": ("Expansion time", "expansion_time_ms", (-50.0, 50.0)),
+    "arrival": ("Arrival", "arrival_time_ms", (-50.0, 50.0)),
     "tau": ("Tau", "tau_ms", (50.0, 200.0)),
 }
 _NAN_MAP_OFFSET = 100000.0  # lifts every real value off 0 so 0 can mean "outside the lung"
@@ -1071,7 +1071,7 @@ def _render_maps_panel(panels, out_path, title, plane="coronal"):
 def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", overwrite=False):
     """
     One combined image, single `plane` projection per map (HU, FRC,
-    Expansion time, TV, FV, J, Tau), everything expressed on R{fix_phase}'s (EI's, R0 in practice) own
+    TV, FV, J, Arrival, Tau), everything expressed on R{fix_phase}'s (EI's, R0 in practice) own
     grid - the direction yi2.sh's own Warped.nii.gz/Jacobian.nii.gz come in,
     so no resampling needed here (see get_maps_single_slice_panel_ee for the
     EE-anchored counterpart, which does need an extra resampling step). Uses
@@ -1107,12 +1107,10 @@ def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", 
         # the data never reaches makes the whole panel look nearly flat.
         ("FRC", _masked_axis_projection(ee_on_ei_img / -1000, ei_mask, axis=axis), 0, 0.8),
     ]
-    # Expansion time (Time Maps step, first-harmonic phase) replaces TLC here;
-    # Tau is added before Deformation. Both are already on this grid and are
-    # skipped until that step has run.
+    # Time Maps outputs (Arrival, then Tau) go after J, before Deformation:
+    # HU, FRC, TV, FV, J, Arrival, Tau, Deformation. Both are already on this
+    # grid and are skipped until that step has run.
     ei_time_maps = {k: _load_time_map(main_dir, outname, spec[1]) for k, spec in PANEL_TIME_MAPS.items()}
-    if ei_time_maps["expansion"] is not None:
-        panels.append(_time_map_panel(ei_time_maps["expansion"], ei_mask, axis, "expansion"))
 
     # TV/FV/J computed voxel-wise in 3D first, THEN collapsed to 2D by
     # averaging - see get_maps_single_slice_panel_ee's longer comment on why
@@ -1143,6 +1141,8 @@ def get_maps_single_slice_panel_ei(main_dir, outname, PHASE=7, plane="coronal", 
     # Whole-lung displacement arrows, on EI's own grid: TotalWarp.nii.gz
     # points EI->EE (see _locate_analysis_maps_files), the EI-grid analogue
     # of the Forward.nii.gz field the EE panel uses.
+    if ei_time_maps["arrival"] is not None:
+        panels.append(_time_map_panel(ei_time_maps["arrival"], ei_mask, axis, "arrival"))
     if ei_time_maps["tau"] is not None:
         panels.append(_time_map_panel(ei_time_maps["tau"], ei_mask, axis, "tau"))
     total_warp = np.asarray(nib.load(files["total_warp_path"]).dataobj).squeeze()
@@ -1211,12 +1211,11 @@ def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", 
     ee_own_img = gaussian_filter(nib.load(ee_grid_files["ee_reference_path"]).get_fdata(), 1)
     jac_on_ee = gaussian_filter(nib.load(ee_grid_files["jac_on_ee_path"]).get_fdata(), 1)  # native EE->EI, >1
 
-    # Expansion time (Time Maps step, resampled onto this grid) replaces TLC
-    # here; Tau is added before Deformation. Skipped until that step has run.
+    # Time Maps outputs (resampled onto this grid) go after J, before
+    # Deformation: HU, FRC, TV, FV, J, Arrival, Tau, Deformation. Skipped
+    # until that step has run.
     ee_time_maps = {k: get_time_map_on_ee_grid(main_dir, outname, spec[1], PHASE=PHASE)
                     for k, spec in PANEL_TIME_MAPS.items()}
-    if ee_time_maps["expansion"] is not None:
-        panels.append(_time_map_panel(ee_time_maps["expansion"], ee_mask, axis, "expansion"))
 
     ei_masked = _mask_bbox_crop(ei_on_ee_img, ee_mask)
     ee_masked = _mask_bbox_crop(ee_own_img, ee_mask)
@@ -1256,6 +1255,8 @@ def get_maps_single_slice_panel_ee(main_dir, outname, PHASE=7, plane="coronal", 
     # points EE->EI (see _locate_diaphragm_warp_and_mask), the same field
     # the diaphragm step's whole-lung arrows already use.
     forward_warp_path, _, _, _ = _locate_diaphragm_warp_and_mask(main_dir, outname, PHASE)
+    if ee_time_maps["arrival"] is not None:
+        panels.append(_time_map_panel(ee_time_maps["arrival"], ee_mask, axis, "arrival"))
     if ee_time_maps["tau"] is not None:
         panels.append(_time_map_panel(ee_time_maps["tau"], ee_mask, axis, "tau"))
     forward_warp = np.asarray(nib.load(forward_warp_path).dataobj).squeeze()
@@ -1321,7 +1322,7 @@ def build_rat_coronal_maps_panel(rat_dir, outname, frame="EI"):
     """
     Stacks every session's own coronal functional-maps panel
     (maps_panel_{frame}_coronal.jpg from get_maps_single_slice_panel_ei/_ee
-    - HU, FRC, Expansion time, TV, FV, J, Tau, Deformation columns) into one combined image
+    - HU, FRC, TV, FV, J, Arrival, Tau, Deformation columns) into one combined image
     under <rat_dir>/Analysis, one row per session in chronological order
     (top = earliest/first timepoint, same ordering as
     get_rat_session_dirs) - lets you see how each functional map changes
@@ -2377,13 +2378,17 @@ FALLBACK_OUTNAME = BASE_OUTNAME + '_fallback'
 
 TIME_MAPS_MIN_AMPLITUDE = 0.02   # voxels whose volume swings < 2% get NaN (timing is noise there)
 TIME_MAPS_ARRIVAL_LEVEL = 0.5    # arrival = reaching 50% of own inspiratory expansion
-TIME_MAPS_FOURIER_CANDIDATES = (2, 3, 4, 5, 6)  # harmonics tried; chosen per session by leave-one-out error
+TIME_MAPS_FOURIER_CANDIDATES = (2, 3, 4, 5, 6)  # harmonics scored by leave-one-out error (reported in the summary)
+# Harmonics used for the fit. 3 by default: on real sessions K=3 and K=4 give
+# nearly identical arrival maps, K=3 has a smoother plateau, and K<=2 distorts
+# the inspiratory rise. Set to None to pick per session by leave-one-out error.
+TIME_MAPS_FOURIER_HARMONICS = 3
 TIME_MAPS_TAU_GRID = np.geomspace(0.02, 2.0, 200)  # seconds; tau candidates for the exponential fit
 TIME_MAP_SPECS = [
     # key, NIfTI stem, panel title, colormap, 6-slice PNG stem, fixed display range (ms)
     ("ei_time", "time_EI_ms", "EI time (ms)", "coolwarm", "EI_time", (-50.0, 50.0)),
     ("arrival", "arrival_time_ms", "Arrival (ms)", "coolwarm", "arrival_time", (-50.0, 50.0)),
-    ("tau", "tau_ms", "Tau (ms)", "cividis", "tau", (50.0, 200.0)),  # ~5-95th pct on real data
+    ("tau", "tau_ms", "Tau (ms)", "plasma", "tau", (50.0, 200.0)),  # ~5-95th pct on real data; TLC's old colormap
     # First-harmonic phase, shown as "Expansion time" (red-blue like the other relative-time maps).
     ("h1_phase", "expansion_time_ms", "Expansion time (ms)", "coolwarm", "expansion_time", (-50.0, 50.0)),
 ]
@@ -2483,7 +2488,7 @@ def _time_maps_from_curves(V, times, period, k_ee, dt=0.001, chunk=20000):
     row so it goes through exactly the same math as every voxel.
 
     EI time and arrival: each curve is fitted by least squares with a
-    periodic Fourier series (harmonic count chosen by leave-one-out error),
+    periodic Fourier series (TIME_MAPS_FOURIER_HARMONICS harmonics, 3 by default),
     evaluated on a `dt` grid, and timing is read off that smooth fit.
     Tau: exponential fit c + a*exp(-t/tau) to the expiratory samples, phase 0
     (EI) through the whole-lung end-expiration phase k_ee.
@@ -2493,7 +2498,8 @@ def _time_maps_from_curves(V, times, period, k_ee, dt=0.001, chunk=20000):
     g = V.mean(axis=0, keepdims=True)
     Vg = np.vstack([V, g])
     n = Vg.shape[0]
-    K, loo_scores = _choose_fourier_harmonics(V, times, period)
+    K_best, loo_scores = _choose_fourier_harmonics(V, times, period)
+    K = TIME_MAPS_FOURIER_HARMONICS or K_best
     A = _fourier_design(times, period, K)
     coef = Vg @ np.linalg.pinv(A).T                       # (n, 2K+1)
     # First-harmonic phase: a1*cos(wt) + b1*sin(wt) = R*cos(w(t - t_h1)),
@@ -2527,12 +2533,21 @@ def _time_maps_from_curves(V, times, period, k_ee, dt=0.001, chunk=20000):
         t_arr[s:s + m] = tg[imin] + (j - 1 + fr) * step
         amp[s:s + m] = a
 
-    # Tau: exponential fit on the expiratory samples (phase-time order).
-    exp_phases = np.argsort(times)[: int(np.searchsorted(np.sort(times), times[k_ee])) + 1]
+    # Tau: exponential fit on the expiratory samples, in time order from the
+    # whole-lung volume peak forward (wrapping around the cycle if needed) to
+    # the whole-lung end-expiration phase. Usually phases 0..k_ee, but not when
+    # phase 0 isn't the peak (e.g. sessions reconstructed with the old binning).
+    order = np.argsort(times)
+    pos_max = int(np.where(order == int(np.argmax(Vg[-1])))[0][0])
+    pos_ee = int(np.where(order == k_ee)[0][0])
+    n_steps = (pos_ee - pos_max) % len(order)
+    steps = np.arange(n_steps + 1) + pos_max
+    exp_phases = order[steps % len(order)]
+    exp_t = times[exp_phases] + period * (steps >= len(order))
     tau = np.empty(n); r2 = np.empty(n); edge = np.empty(n, dtype=bool)
     for s in range(0, n, chunk * 5):
         tau[s:s + chunk * 5], r2[s:s + chunk * 5], edge[s:s + chunk * 5] = _fit_expiratory_tau(
-            Vg[s:s + chunk * 5][:, exp_phases], times[exp_phases], TIME_MAPS_TAU_GRID)
+            Vg[s:s + chunk * 5][:, exp_phases], exp_t, TIME_MAPS_TAU_GRID)
 
     def _wrap(d):  # circular difference into (-period/2, period/2]
         return (d + period / 2) % period - period / 2
@@ -2554,6 +2569,7 @@ def _time_maps_from_curves(V, times, period, k_ee, dt=0.001, chunk=20000):
     vr2 = r2[:-1][valid[:-1] & np.isfinite(r2[:-1])]
     info = {
         "fourier_harmonics": int(K),
+        "fourier_harmonics_best_by_loo": int(K_best),
         "fourier_loo_rms_by_harmonics": {str(k): v for k, v in loo_scores.items()},
         "fourier_fit_rms_median": float(np.median(np.sqrt(((V - coef[:-1] @ A.T) ** 2).mean(axis=1)))),
         "tau_fit_phases": [int(p) for p in exp_phases],
@@ -2681,13 +2697,39 @@ def get_time_maps(main_dir, outname, overwrite=False):
     k_ee = int(np.argmin(g))
     # Sanity check: the whole-lung volume curve should track the breathing
     # signal's amplitude at each phase if labels and times line up.
+    #
+    # Sessions reconstructed with the binning code from before 2026-09-25 can
+    # have label 0 sitting elsewhere in the cycle (typically between labels 14
+    # and 15) while real_time.npy/real_amps.npy were saved sorted by time, so
+    # stored index i is not label i. Labels 1..15 stay in time order there, so
+    # test every position of label 0 in the time order and keep the one whose
+    # volume curve best matches the stored breathing amplitudes. Position 0
+    # (the stored order) is kept unless another is clearly better.
     ra_path = os.path.join(out_root, "real_amps.npy")
     amp_corr = None
+    phase_order_fix = None
     if os.path.isfile(ra_path):
         ra = np.asarray(np.load(ra_path), dtype=np.float64).ravel()
         if len(ra) == n_phases:
-            amp_corr = float(np.corrcoef(ra, g)[0, 1])
-            if amp_corr < 0.8:
+            def _order(p):
+                L = list(range(1, n_phases))
+                L.insert(p, 0)
+                return np.array(L)
+            scores = [float(np.corrcoef(ra, g[_order(p)])[0, 1]) for p in range(n_phases)]
+            best = int(np.argmax(scores))
+            amp_corr = scores[0]
+            if best != 0 and scores[best] > 0.95 and scores[best] - scores[0] > 0.02:
+                L = _order(best)
+                fixed = np.empty_like(times)
+                fixed[L] = times  # stored index i (time-sorted) belongs to label L[i]
+                print(f"  Phase order corrected: label 0 sits at position {best} in time order "
+                      f"(volume vs breathing amplitude corr {scores[0]:.3f} -> {scores[best]:.3f}); "
+                      "this session was binned with the pre-2026-09-25 code.", flush=True)
+                phase_order_fix = {"label0_time_position": best, "corr_stored_order": scores[0],
+                                   "corr_corrected": scores[best]}
+                times = fixed
+                amp_corr = scores[best]
+            if amp_corr < 0.95:
                 print(f"WARNING: whole-lung volume vs breathing amplitude correlation is only {amp_corr:.2f} - "
                       "phase labels and phase times may not line up for this session.", flush=True)
 
@@ -2747,8 +2789,9 @@ def get_time_maps(main_dir, outname, overwrite=False):
 
     # Summary figure: whole-lung volume curve + distribution of each map.
     fig, axes = plt.subplots(1, 1 + len(TIME_MAP_SPECS), figsize=(5 * (1 + len(TIME_MAP_SPECS)), 4.2))
-    tt = np.concatenate([times, [times[0] + period]]) * 1000
-    gg = np.concatenate([g, [g[0]]])
+    tord = np.argsort(times)  # plot in time order (labels may not be, see phase_order_fix)
+    tt = np.concatenate([times[tord], [times[tord[0]] + period]]) * 1000
+    gg = np.concatenate([g[tord], [g[tord[0]]]])
     axes[0].plot(tt, gg, "k-o", ms=4)
     for k in range(n_phases):
         axes[0].annotate(str(k), (times[k] * 1000, g[k]), textcoords="offset points", xytext=(0, 6),
@@ -2808,6 +2851,7 @@ def get_time_maps(main_dir, outname, overwrite=False):
             "h1_phase": ref_s["h1_phase"] * 1000,
         },
         "volume_vs_breathing_amplitude_corr": amp_corr,
+        "phase_order_correction": phase_order_fix,
         "fits": fit_info,
         "lung_voxels": n_vox,
         "valid_voxels": int(valid.sum()),

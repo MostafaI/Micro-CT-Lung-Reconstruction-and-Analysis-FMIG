@@ -397,13 +397,13 @@ def get_maps(main_dir , outname, progress_callback=None, **kwargs):
 def save_combined_maps_figure(maps_dir, out_name="maps.png", label_pad_px=300, bg=(0, 0, 0),
                               order=None, smooth=None):
     # (row label, PNG stem). TLC is no longer shown; the Time Maps step's
-    # expansion time (first-harmonic phase) and tau rows appear once it has run.
+    # arrival-time and tau rows appear once it has run.
     # order/smooth can be overridden, e.g. to rebuild an older maps.png layout.
     if order is None:
-        order = [("FRC", "FRC"), ("Exp. time", "expansion_time"), ("TV", "TV"), ("FV", "FV"),
-                 ("J", "J"), ("Tau", "tau")]
+        order = [("FRC", "FRC"), ("TV", "TV"), ("FV", "FV"), ("J", "J"),
+                 ("Arrival", "arrival_time"), ("Tau", "tau")]
     if smooth is None:
-        smooth = ['TV', 'expansion_time', 'tau']
+        smooth = ['TV', 'arrival_time', 'tau']
     items = [] 
     for name, stem in order:
         p = os.path.join(maps_dir, f"{stem}.png") if stem not in smooth else os.path.join(maps_dir, f"{stem}_smoothed.png")
