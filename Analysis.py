@@ -80,8 +80,13 @@ def compress_files(main_dir, outname,progress_callback=None, **kwargs):
     # Check if the files are zipped 
     threads = []
     for file in files:
-        if '.nii.gz' not in file and '.nii' in file and file + '.gz' not in files:
-            threads.append(threading.Thread(target=gzip_file, args=(file,)))
+        # Never overwrite an existing .nii.gz (it may be the volume the masks
+        # were made from); the stray .nii is left alone and reported.
+        if os.path.isfile(file + '.gz'):
+            print(f"Not compressing {os.path.basename(file)}: "
+                  f"{os.path.basename(file)}.gz already exists (kept as is).")
+            continue
+        threads.append(threading.Thread(target=gzip_file, args=(file,)))
     for thread in threads:
         thread.start()
     for j, thread in enumerate(threads):
@@ -97,8 +102,20 @@ def segment(main_dir, outname, progress_callback=None,printtolog=False, **kwargs
     # Run the segmentation on all the files
     threads = []
     for file in files:
-        if '_m.nii.gz' not in file and '_lung.nii.gz' not in file and '.nii' in file and 'sharp' not in file:
+        # Only the phase volumes ("..._R<i>.nii.gz"): Results also holds masks
+        # and derived masks (_mLR, registration's _mLow_Dilated) that must not
+        # be segmented themselves.
+        # Phases that already have a mask are skipped up front, so the
+        # progress bar only counts volumes actually being segmented.
+        if re.search(r'_R\d+\.nii\.gz$', file) and 'sharp' not in file:
+            if os.path.isfile(file.replace('.nii', '_m.nii')):
+                continue
             threads.append(threading.Thread(target=extract_ct_mask,args=(file,),kwargs={'printtolog':printtolog, 'lung_at_boundaries':True}))
+    if threads:
+        print(f"Segmenting {len(threads)} phase volume(s) without a mask: "
+              + ", ".join(os.path.basename(t._args[0]) for t in threads), flush=True)
+    else:
+        print("Every phase volume already has a mask - none segmented.", flush=True)
     for thread in threads:
         thread.start()
     for j, thread in enumerate(threads):

@@ -224,8 +224,93 @@ def clean_study_folder(session):
             pt = True
     print()
             
+_RESULT_VOLUME_RE = None
+
+
+def existing_result_phases(main_dir, outname):
+    """Phases that already have a reconstructed volume in <outname>/Results
+    ("..._R<i>.nii" or ".nii.gz"; masks "_R<i>_m..." don't count)."""
+    global _RESULT_VOLUME_RE
+    import re
+    if _RESULT_VOLUME_RE is None:
+        _RESULT_VOLUME_RE = re.compile(r"_R(\d+)\.nii(\.gz)?$")
+    results = os.path.join(main_dir, outname, 'Results')
+    if not os.path.isdir(results):
+        return set()
+    return {int(m.group(1)) for m in map(_RESULT_VOLUME_RE.search, os.listdir(results)) if m}
+
+
+def _phase_number(phase_dir):
+    import re
+    m = re.match(r"^Phase_(\d+)$", os.path.basename(os.path.normpath(phase_dir)))
+    return int(m.group(1)) if m else None
+
+
+def _phase_dirs(root_dir):
+    """Phase_<n> folders under root_dir that have projections, by number."""
+    if not os.path.isdir(root_dir):
+        return []
+    out = [os.path.join(root_dir, d) for d in os.listdir(root_dir)
+           if _phase_number(d) is not None and os.path.isdir(os.path.join(root_dir, d, 'ct-data', 'corr'))]
+    return sorted(out, key=_phase_number)
+
+
+def _phase_has_volume(phase_dir):
+    results = os.path.join(phase_dir, 'Results')
+    return os.path.isdir(results) and any(f.endswith('.nii') for f in os.listdir(results))
+
+
+def collect_results_no_overwrite(main_dir, outname):
+    """recon_functions_all.collect_results, except a phase whose volume is
+    already in Results (as .nii or .nii.gz) is never copied over."""
+    output_dir = os.path.join(main_dir, outname)
+    results_dir = os.path.join(output_dir, 'Results')
+    os.makedirs(results_dir, exist_ok=True)
+    existing = existing_result_phases(main_dir, outname)
+    for phase_dir in _phase_dirs(output_dir):
+        i = _phase_number(phase_dir)
+        if i in existing:
+            continue
+        phase_results = os.path.join(phase_dir, 'Results')
+        vols = sorted(f for f in os.listdir(phase_results) if f.endswith('.nii')) if os.path.isdir(phase_results) else []
+        if not vols:
+            print(f"Phase_{i}: no reconstructed volume found to collect.")
+            continue
+        shutil.copy(os.path.join(phase_results, vols[0]),
+                    os.path.join(results_dir, vols[0].replace('.nii', '_R' + str(i) + '.nii')))
+
+
+def segmentation_complete(main_dir, outname):
+    """True when Results has phase volumes, every one has its "_m" mask, and
+    the cached mask.npy/raw.npy stacks exist - i.e. the Segment step has
+    nothing left to produce."""
+    import re
+    results = os.path.join(main_dir, outname, 'Results')
+    if not os.path.isdir(results):
+        return False
+    files = set(os.listdir(results))
+    volumes = [f for f in files if re.search(r"_R\d+\.nii(\.gz)?$", f)]
+    if not volumes:
+        return False
+    for v in volumes:
+        stem = re.sub(r"\.nii(\.gz)?$", "", v)
+        if stem + "_m.nii.gz" not in files and stem + "_m.nii" not in files:
+            return False
+    return "mask.npy" in files and "raw.npy" in files
+
+
 def MI_reconstruction(main_dir, threshold=0.5, use_fallback_timing=False):
+    """Returns "skipped" when every phase already has a reconstructed volume
+    in Results - nothing is redone or overwritten then. Otherwise only the
+    phases missing a volume (in Results or in their Phase_<n> folder) are
+    reconstructed, and existing volumes are never overwritten."""
     global outname
+    existing_outname = resolve_outname(main_dir)
+    if set(range(TIME_PHASES)) <= existing_result_phases(main_dir, existing_outname):
+        outname = existing_outname
+        print(f"Reconstruction already exists ({TIME_PHASES} phase volumes in "
+              f"{os.path.join(existing_outname, 'Results')}) - skipping it, nothing overwritten.", flush=True)
+        return "skipped"
     corr_dir = os.path.join(main_dir, 'ct-data', 'corr')
     # outname is decided per-session, from whether THIS session's own
     # timing actually needed the fallback - not just from the flag being
@@ -250,8 +335,18 @@ def MI_reconstruction(main_dir, threshold=0.5, use_fallback_timing=False):
                             identifier='',
                             impute=True)
     root_dir = os.path.join(main_dir, outname)
-    recon(root_dir)
-    collect_results(main_dir, bm3d=False, mname=outname)
+    in_results = existing_result_phases(main_dir, outname)
+    phase_dirs = _phase_dirs(root_dir)
+    todo = [d for d in phase_dirs if _phase_number(d) not in in_results and not _phase_has_volume(d)]
+    if todo and len(todo) == len(phase_dirs):
+        recon(root_dir)
+    elif todo:
+        print(f"Reconstructing only the {len(todo)} phase(s) without a volume yet: "
+              f"{', '.join(os.path.basename(d) for d in todo)}", flush=True)
+        recon(root_dir, phase_dirs=todo)
+    else:
+        print("Every phase already has a reconstructed volume - not reconstructing again.", flush=True)
+    collect_results_no_overwrite(main_dir, outname)
     make_gif(main_dir, outname, aslice=260, origin='lower')
     clean_study_folder(main_dir)
     log_artifact(os.path.join(main_dir, outname, 'Results', 'images', 'video.gif'))
@@ -282,16 +377,21 @@ def _recon_via_warm_server(ROOT_DIR):
     return run_recon_via_server(ROOT_DIR, on_line=on_line)
 
 
-def recon(ROOT_DIR):
+def recon(ROOT_DIR, phase_dirs=None):
+    """Reconstructs every Phase_* under ROOT_DIR, or only `phase_dirs` if
+    given (the server and milabs_rtk_recon.py both accept a single phase
+    folder as their root)."""
     if not os.path.isdir(ROOT_DIR):
         raise FileNotFoundError(f"root dir does not exist: {ROOT_DIR}")
+    targets = [ROOT_DIR] if phase_dirs is None else list(phase_dirs)
 
     try:
-        returncode = _recon_via_warm_server(ROOT_DIR)
-        print(f"\nExit code: {returncode}")
-        if returncode != 0:
-            raise RuntimeError(f"recon server job exited with code {returncode}")
-        return returncode
+        for target in targets:
+            returncode = _recon_via_warm_server(target)
+            print(f"\nExit code: {returncode}")
+            if returncode != 0:
+                raise RuntimeError(f"recon server job exited with code {returncode} ({target})")
+        return 0
     except ConnectionRefusedError:
         pass  # server not running - fall back below
     except ImportError:
@@ -302,7 +402,7 @@ def recon(ROOT_DIR):
           flush=True)
     BAT_PATH = os.path.join(PIPELINE_DIR, "recon_phase.bat")
     EXTRA_ARGS = []
-    cmd = [BAT_PATH, ROOT_DIR, *EXTRA_ARGS]
+    cmd = [BAT_PATH, *targets, *EXTRA_ARGS]
     process = subprocess.Popen(
         cmd,
         cwd=PIPELINE_DIR,
@@ -321,7 +421,8 @@ def recon(ROOT_DIR):
     return returncode
 
 
-from register_phases import register_all_phases, find_bash, run_registration, DEFAULT_ANTSPATH
+from register_phases import (register_all_phases, find_bash, run_registration, DEFAULT_ANTSPATH,
+                             prune_pair_outputs)
 
 
 def _pipeline_config_path(main_dir, outname):
@@ -2261,6 +2362,16 @@ def visualize_diaphragm_descent_2d_panel(main_dir, outname, PHASE=7, diaphragm_f
 
 
 def diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
+    """Runs _diaphragm_step, then always drops the per-session warp-field
+    cache (~5.6 GB per session) - Group/Automated runs process every session
+    in one driver process, so it would otherwise grow until memory runs out."""
+    try:
+        return _diaphragm_step(main_dir, outname, PHASE=PHASE, diaphragm_fraction=diaphragm_fraction)
+    finally:
+        _DIAPHRAGM_REGION_CACHE.clear()
+
+
+def _diaphragm_step(main_dir, outname, PHASE=7, diaphragm_fraction=0.15):
     """
     Estimate diaphragm (lower-lung) downward motion - same computation as
     estimate_diaphragm_motion.ipynb. Requires the Register step to have been
@@ -2935,7 +3046,7 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
     if "recon" in steps:
         log_step("recon")
         try:
-            MI_reconstruction(main_dir, threshold=threshold, use_fallback_timing=use_fallback_timing)
+            recon_result = MI_reconstruction(main_dir, threshold=threshold, use_fallback_timing=use_fallback_timing)
         except DegenerateTimingError as e:
             # Distinct marker (not just ===STEP_FAILED===) so the GUI can
             # recognize this specific case and offer to retry with the
@@ -2948,19 +3059,29 @@ def run(main_dir, steps, threshold=0.5, announce_done=True, use_fallback_timing=
             return 1
         if outname != BASE_OUTNAME:
             print(f"Using fallback output folder: {outname}", flush=True)
-        _step_done(main_dir, "recon", threshold=threshold, use_fallback_timing=use_fallback_timing)
+        if recon_result == "skipped":
+            print("===STEP_SKIPPED=== recon: reconstruction already exists", flush=True)
+        else:
+            _step_done(main_dir, "recon", threshold=threshold, use_fallback_timing=use_fallback_timing)
 
     if "segment" in steps:
         log_step("segment")
-        try:
-            compress_files(main_dir, outname)
-            segment(main_dir, outname)
-            make_gif_cropped(main_dir, outname=outname, vmin=-1150, vmax=350, frame=-1)
-            log_artifact(os.path.join(main_dir, outname, 'Results', 'images_cropped', 'video.gif'))
-        except Exception as e:
-            log_failed("segment", e)
-            return 1
-        _step_done(main_dir, "segment")
+        if segmentation_complete(main_dir, outname):
+            # Nothing re-segmented, no GIFs redrawn, and not re-recorded as
+            # run in fmig_code_version.json.
+            print("Segmentation already exists (every phase has its mask) - skipping it, "
+                  "nothing overwritten.", flush=True)
+            print("===STEP_SKIPPED=== segment: segmentation already exists", flush=True)
+        else:
+            try:
+                compress_files(main_dir, outname)
+                segment(main_dir, outname)
+                make_gif_cropped(main_dir, outname=outname, vmin=-1150, vmax=350, frame=-1)
+                log_artifact(os.path.join(main_dir, outname, 'Results', 'images_cropped', 'video.gif'))
+            except Exception as e:
+                log_failed("segment", e)
+                return 1
+            _step_done(main_dir, "segment")
 
     if "segment_lr" in steps:
         log_step("segment_lr")
@@ -3479,6 +3600,11 @@ def register_phase0_to_baseline(baseline_dir, moving_dir, outname, antspath=None
         ok = run_registration(bash_exe, antspath, fixname, movname, staging_dir, output_dir)
         if not ok:
             raise RuntimeError(f"Registration failed: {fixname} -> {movname}")
+        # The forward field is still needed below (baseline mask onto the
+        # moving grid); only the inverse warps are unused.
+        n, freed = prune_pair_outputs(output_dir, keep_fields=True)
+        if n:
+            print(f"Removed {n} unused inverse warp file(s) ({freed / 1e9:.1f} GB)")
         print(f"Done. Warped image: {warped_path}")
 
     if baseline_mask_on_moving_grid.is_file() and not force:

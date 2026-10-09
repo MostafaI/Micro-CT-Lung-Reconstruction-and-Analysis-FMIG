@@ -1008,8 +1008,16 @@ def correct_corr_dir(main_corr_dir, out_dir='',pixels=1):
     
 def make_gif(main_dir, outname, aslice, origin='lower'):
     adir = os.path.join(main_dir, outname, 'Results')
-    # adir = adir.replace('Results', 'Mostafa\Results')
-    images   = [x for x in os.listdir(adir) if '.nii' in x and 'mask' not in x]
+    # One volume per phase: "<stem>_R<i>.nii" or ".nii.gz" (masks "_R<i>_m..."
+    # don't match). If both forms exist for a phase, the .nii.gz is used.
+    import re
+    images = {}
+    for x in sorted(os.listdir(adir)):
+        m = re.search(r'_R(\d+)\.nii(\.gz)?$', x)
+        if m and 'mask' not in x:
+            k = int(m.group(1))
+            if k not in images or x.endswith('.gz'):
+                images[k] = x
     outdir   = os.path.join(adir, 'images')
     gif_name = os.path.join(adir, 'images','video.gif')
     if not os.path.isdir(outdir): os.mkdir(outdir)
@@ -1017,14 +1025,13 @@ def make_gif(main_dir, outname, aslice, origin='lower'):
     fps = 100
     # vmin,vmax = -1500,1000
     vmin,vmax = -1150,350
-    for i in range(len(images)):
-        im = [x for x in os.listdir(adir) if '_R'+str(i)+'.nii' in x][0]
+    for i in sorted(images):
+        im = images[i]
+        png = re.sub(r'\.nii(\.gz)?$', '.png', im)
         img = nib.load(os.path.join(adir,im)).get_fdata()
-        plt.imsave(os.path.join(outdir, im.replace('.nii','.png')),
+        plt.imsave(os.path.join(outdir, png),
                    img[:,aslice,:].T, cmap='gray',vmin=vmin,vmax=vmax,origin=origin)
-        # plt.imsave(os.path.join(outdir, im.replace('.nii','.png')),
-        #            img[:,aslice,:].T, cmap='gray',vmin=vmin,vmax=vmax)
-        imarray.append(Image.open(os.path.join(outdir, im.replace('.nii','.png')))) # img.shape[1]//2
+        imarray.append(Image.open(os.path.join(outdir, png))) # img.shape[1]//2
         # plt.imshow(img[:,img.shape[1]//2,:], cmap='gray',vmin=-1500,vmax=5000)
     imarray[0].save(gif_name, save_all=True, append_images=imarray[1:], 
                     duration=fps, loop=0, vmax=vmax,vmin=vmin, cmap='gray') 

@@ -1638,6 +1638,10 @@ class App(tk.Tk):
             key = line.split("===STEP_DONE=== ", 1)[1].strip()
             if key in labels:
                 labels[key].config(text="done", foreground="#0a5")
+        elif line.startswith("===STEP_SKIPPED=== "):
+            key = line.split("===STEP_SKIPPED=== ", 1)[1].split(":", 1)[0].strip()
+            if key in labels:
+                labels[key].config(text="exists, skipped", foreground="#08c")
         elif line.startswith("===STEP_FAILED=== "):
             rest = line.split("===STEP_FAILED=== ", 1)[1]
             key = rest.split(":", 1)[0].strip()

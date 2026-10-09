@@ -37,6 +37,45 @@ BASH_CANDIDATES = [
 
 PHASE_RE = re.compile(r"^(.+)_R(\d+)\.nii\.gz$")
 
+# yi2.sh leaves every ANTs output in the pair folder, ~10 GB per pair. Only
+# some of it is read afterwards (see prune_pair_outputs):
+#   - the inverse warps are used only inside yi2.sh itself;
+#   - the forward warps / composed fields / warped image are read only for the
+#     pair the analysis steps use (R7 -> R0 by default; pipeline_driver's
+#     PHASE=7). Every pair's Jacobian is kept (Time Maps reads all of them,
+#     and it is the "already registered" marker).
+INVERSE_WARP_SUFFIXES = (
+    "_outputPrefixResults1InverseWarp.nii.gz",
+    "_outputPrefixResults2InverseWarp.nii.gz",
+)
+FIELD_SUFFIXES = (
+    "_outputPrefixResults1Warp.nii.gz",
+    "_outputPrefixResults2Warp.nii.gz",
+    "_TotalWarp.nii.gz",
+    "_TotalWarp_Forward.nii.gz",
+    "_Warped.nii.gz",
+)
+KEEP_FIELDS_PHASES = (7,)
+
+
+def prune_pair_outputs(pair_dir, keep_fields):
+    """Deletes the registration outputs nothing reads after yi2.sh finishes:
+    always the two inverse warps, and also the forward warps, composed
+    fields and warped image unless keep_fields. Only acts on a completed
+    pair (its Jacobian exists). Returns (files removed, bytes freed)."""
+    pair_dir = Path(pair_dir)
+    if not any(p.name.endswith("_Jacobian.nii.gz") for p in pair_dir.iterdir()):
+        return 0, 0
+    suffixes = INVERSE_WARP_SUFFIXES + (() if keep_fields else FIELD_SUFFIXES)
+    n = freed = 0
+    for p in pair_dir.iterdir():
+        if p.is_file() and p.name.endswith(suffixes):
+            size = p.stat().st_size
+            p.unlink()
+            n += 1
+            freed += size
+    return n, freed
+
 
 def find_bash():
     for candidate in BASH_CANDIDATES:
@@ -91,7 +130,8 @@ def run_registration(bash_exe, antspath, fixname, movname, input_path, output_pa
     return result.returncode == 0
 
 
-def register_all_phases(results_dir, antspath=DEFAULT_ANTSPATH, only_phases=None, force=False):
+def register_all_phases(results_dir, antspath=DEFAULT_ANTSPATH, only_phases=None, force=False,
+                        keep_fields_phases=KEEP_FIELDS_PHASES):
     """
     Register every phase in results_dir onto R0 via yi2.sh.
 
@@ -99,6 +139,9 @@ def register_all_phases(results_dir, antspath=DEFAULT_ANTSPATH, only_phases=None
     only_phases: iterable of phase numbers to restrict to (e.g. [7] for just R7->R0);
                  None (default) registers every phase except R0.
     force: re-run phases whose output already exists (normally skipped).
+    keep_fields_phases: phases whose warp fields / warped image are kept
+                 after registering (others keep only their Jacobian - see
+                 prune_pair_outputs). Phases in only_phases are always kept.
 
     Returns the list of phases that failed (empty list = full success).
     """
@@ -138,6 +181,11 @@ def register_all_phases(results_dir, antspath=DEFAULT_ANTSPATH, only_phases=None
         if not ok:
             failures.append(phase)
             print(f"FAILED: R{phase} -> R0")
+            continue
+        keep = phase in set(keep_fields_phases) or (only_phases is not None and phase in set(only_phases))
+        n, freed = prune_pair_outputs(out_dir, keep_fields=keep)
+        if n:
+            print(f"Removed {n} unused warp file(s) from R{phase}_to_R0 ({freed / 1e9:.1f} GB)")
 
     print("\n=== Summary ===")
     print(f"{len(targets) - len(failures)}/{len(targets)} phases registered successfully")
