@@ -16,6 +16,12 @@ Usage:
     --rats for multiple rats; mutually exclusive with the positional main_dir:
         python pipeline_driver.py --rats "D:\\Data\\PhNd7" --rats "D:\\Data\\PhNd9" --steps diaphragm
 
+    Automated mode - every rat folder under one data root, every session
+    dated on or after --since, rat by rat and session by session (the app's
+    "Automated" mode). --skip-done skips steps a session already records as
+    done in its fmig_code_version.json:
+        python pipeline_driver.py --data-root "D:\\Data" --since 2026-10-01 --steps recon,segment --skip-done
+
 Must be run with the "general app" environment's python.exe - the one
 setup_environment.bat (repo root) builds at <install root>\python\python.exe
 (fmig_rat_app.py resolves and passes this automatically; see its
@@ -3089,6 +3095,39 @@ def get_rat_session_dirs(rat_dir):
     )
 
 
+def session_date(session_dir):
+    """'YYYY-MM-DD' from a session folder name like 2026-10-06_12h54, or None."""
+    import re
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})_\d{2}h\d{2}$", os.path.basename(os.path.normpath(session_dir)))
+    return m.group(1) if m else None
+
+
+def find_rats_with_sessions_since(data_root, since):
+    """Automated mode: every rat folder directly under data_root (e.g.
+    D:\\Data) that has at least one session dated on or after `since`
+    ('YYYY-MM-DD'), as {rat_dir: [those sessions, chronological]}, rats in
+    name order."""
+    out = {}
+    for name in sorted(os.listdir(data_root), key=str.lower):
+        rat_dir = os.path.join(data_root, name)
+        if not os.path.isdir(rat_dir):
+            continue
+        sessions = [s for s in get_rat_session_dirs(rat_dir) if session_date(s) >= since]
+        if sessions:
+            out[rat_dir] = sessions
+    return out
+
+
+def completed_steps(session_dir):
+    """Steps recorded as successfully run in session_dir/fmig_code_version.json."""
+    path = os.path.join(session_dir, "fmig_code_version.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(json.load(f).get("steps", {}))
+    except (OSError, ValueError):
+        return set()
+
+
 def compute_session_lung_volumes(main_dir, outname):
     """
     Air volume (mL) at this session's own true end-inspiration and
@@ -3492,7 +3531,8 @@ def register_baseline_for_rat(rat_dir, outname, sessions=None, antspath=None, fo
     return out_dirs
 
 
-def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False):
+def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False,
+              sessions_by_rat=None, skip_done=False):
     """
     Runs `steps` (the same set run() runs for one dataset) across every
     session found under each rat directory in `rat_dirs` - one rat at a
@@ -3508,9 +3548,18 @@ def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False):
     overall return code is 1 if any session failed, 0 only if every
     session's every requested step succeeded.
     """
-    sessions_by_rat = {rat_dir: get_rat_session_dirs(rat_dir) for rat_dir in rat_dirs}
+    # sessions_by_rat, if given, limits which sessions run (Automated mode:
+    # only sessions on/after a start date). skip_done drops, per session,
+    # any step already recorded as done in its fmig_code_version.json.
+    if sessions_by_rat is None:
+        sessions_by_rat = {rat_dir: get_rat_session_dirs(rat_dir) for rat_dir in rat_dirs}
     total_sessions = sum(len(s) for s in sessions_by_rat.values())
     print(f"\n===GROUP_START=== rats={len(rat_dirs)} sessions={total_sessions}", flush=True)
+    # The full plan up front, so the GUI can list every session and count
+    # what is left.
+    for rat_dir in rat_dirs:
+        for session_dir in sessions_by_rat.get(rat_dir, []):
+            print(f"===PLAN=== {session_dir}", flush=True)
 
     overall_rc = 0
     done = 0
@@ -3523,8 +3572,18 @@ def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False):
         for session_dir in sessions:
             done += 1
             print(f"\n===SESSION=== {session_dir} ({done}/{total_sessions})", flush=True)
+            session_steps = steps
+            if skip_done:
+                already = completed_steps(session_dir)
+                session_steps = [s for s in steps if s not in already]
+                skipped = [s for s in steps if s in already and s != "register_to_baseline"]
+                if skipped:
+                    print(f"Already done here, skipping: {', '.join(skipped)}", flush=True)
+                if not [s for s in session_steps if s != "register_to_baseline"]:
+                    print(f"===SESSION_SKIPPED=== {session_dir}", flush=True)
+                    continue
             try:
-                rc = run(session_dir, steps, threshold=threshold, announce_done=False,
+                rc = run(session_dir, session_steps, threshold=threshold, announce_done=False,
                          use_fallback_timing=use_fallback_timing)
             except Exception as e:
                 print(f"===SESSION_FAILED=== {session_dir}: {e}", flush=True)
@@ -3548,12 +3607,16 @@ def run_group(rat_dirs, steps, threshold=0.5, use_fallback_timing=False):
                 # rather than trusting the module-level outname - by this
                 # point it holds whatever the last session processed above
                 # left it as, which needn't match this rat's baseline.
-                baseline_outname = resolve_outname(sessions[0]) if sessions else outname
-                for d in register_baseline_for_rat(rat_dir, baseline_outname, sessions=sessions):
+                # Always the rat's full session list, so the baseline stays its
+                # earliest session even when only later ones ran this time
+                # (already-registered sessions are skipped, force=False).
+                all_sessions = get_rat_session_dirs(rat_dir)
+                baseline_outname = resolve_outname(all_sessions[0]) if all_sessions else outname
+                for d in register_baseline_for_rat(rat_dir, baseline_outname, sessions=all_sessions):
                     log_artifact(d)
                 log_done("register_to_baseline")
                 record_code_version(rat_dir, "register_to_baseline", outname=baseline_outname,
-                                    sessions=[os.path.basename(os.path.normpath(s)) for s in sessions])
+                                    sessions=[os.path.basename(os.path.normpath(s)) for s in all_sessions])
             except Exception as e:
                 overall_rc = 1
                 log_failed("register_to_baseline", e)
@@ -3572,6 +3635,15 @@ def main():
                               r'session subfolders). Repeat --rats once per rat to run several. Every '
                               r'session found under each rat directory is run in turn (see '
                               r'get_rat_session_dirs). Mutually exclusive with the positional main_dir.')
+    parser.add_argument("--data-root", default=None,
+                        help=r'Automated mode: folder holding every rat folder, e.g. D:\Data. Runs every '
+                             r'session dated on/after --since, rat by rat, session by session. Mutually '
+                             r'exclusive with main_dir and --rats.')
+    parser.add_argument("--since", default=None,
+                        help="Automated mode start date, YYYY-MM-DD (sessions on that day are included).")
+    parser.add_argument("--skip-done", action="store_true",
+                        help="Group/Automated mode: skip steps a session's fmig_code_version.json "
+                             "already records as done.")
     parser.add_argument("--steps", default=",".join(STEP_ORDER),
                          help="Comma-separated subset of: " + ",".join(STEP_ORDER))
     parser.add_argument("--threshold", type=float, default=0.5,
@@ -3599,6 +3671,32 @@ def main():
         print(f"threshold {threshold} out of range (0, 1] - using {clamped}", file=sys.stderr)
         threshold = clamped
 
+    if args.data_root:
+        if args.main_dir or args.rats:
+            print("--data-root is mutually exclusive with main_dir and --rats.", file=sys.stderr)
+            return 2
+        if not os.path.isdir(args.data_root):
+            print(f"Data root not found: {args.data_root}", file=sys.stderr)
+            return 2
+        try:
+            since = time.strftime("%Y-%m-%d", time.strptime(args.since or "", "%Y-%m-%d"))
+        except ValueError:
+            print(f"--since must be a date like 2026-10-01 (got {args.since!r}).", file=sys.stderr)
+            return 2
+        sessions_by_rat = find_rats_with_sessions_since(args.data_root, since)
+        print(f"data_root = {args.data_root}")
+        print(f"since = {since}")
+        print(f"steps = {steps}")
+        print(f"threshold = {threshold}")
+        if not sessions_by_rat:
+            print(f"No session folders dated on or after {since} under {args.data_root}.", flush=True)
+            print("\n===GROUP_START=== rats=0 sessions=0", flush=True)
+            print("\n===GROUP_ALL_DONE=== 0/0 sessions processed", flush=True)
+            return 0
+        return run_group(list(sessions_by_rat), steps, threshold=threshold,
+                         use_fallback_timing=args.use_fallback_timing,
+                         sessions_by_rat=sessions_by_rat, skip_done=args.skip_done)
+
     if args.rats:
         if args.main_dir:
             print("main_dir and --rats are mutually exclusive - pass one or the other.", file=sys.stderr)
@@ -3610,7 +3708,8 @@ def main():
         print(f"rats = {args.rats}")
         print(f"steps = {steps}")
         print(f"threshold = {threshold}")
-        return run_group(args.rats, steps, threshold=threshold, use_fallback_timing=args.use_fallback_timing)
+        return run_group(args.rats, steps, threshold=threshold, use_fallback_timing=args.use_fallback_timing,
+                         skip_done=args.skip_done)
 
     if not args.main_dir:
         print("Either main_dir or --rats is required.", file=sys.stderr)

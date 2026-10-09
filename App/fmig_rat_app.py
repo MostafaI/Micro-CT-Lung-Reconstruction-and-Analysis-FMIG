@@ -8,8 +8,10 @@ Runs pipeline_driver.py (next to this file) as a subprocess using the
 self-contained "general app" Python environment set up by
 ../setup_environment.bat, and streams its output live into this window.
 """
+import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -200,6 +202,52 @@ GROUP_ONLY_STEPS = [
                               "first session, needs Segment)"),
 ]
 ALL_STEPS = STEPS + GROUP_ONLY_STEPS
+
+
+# Automated mode: session folders are named YYYY-MM-DD_HHhMM directly under a
+# rat folder, and rat folders sit directly under one data root (D:\Data).
+# Same pattern as pipeline_driver.get_rat_session_dirs - duplicated here
+# because importing pipeline_driver in the GUI process costs ~12 s.
+SESSION_DIR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_\d{2}h\d{2}$")
+DEFAULT_DATA_ROOT = r"D:\Data"
+
+
+def scan_data_root(data_root):
+    """{rat_dir: [(date 'YYYY-MM-DD', session_dir), ...] chronological} for
+    every rat folder under data_root that has session folders."""
+    out = {}
+    try:
+        names = sorted(os.listdir(data_root), key=str.lower)
+    except OSError:
+        return out
+    for name in names:
+        rat_dir = os.path.join(data_root, name)
+        if not os.path.isdir(rat_dir):
+            continue
+        try:
+            subs = os.listdir(rat_dir)
+        except OSError:
+            continue
+        sessions = []
+        for d in subs:
+            m = SESSION_DIR_RE.match(d)
+            if m and os.path.isdir(os.path.join(rat_dir, d)):
+                sessions.append((m.group(1), os.path.join(rat_dir, d)))
+        if sessions:
+            out[rat_dir] = sorted(sessions, key=lambda x: os.path.basename(x[1]))
+    return out
+
+
+def parse_start_date(text):
+    """'YYYY-MM-DD' normalized, or None if text isn't a valid date."""
+    try:
+        return datetime.datetime.strptime(text.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _path_key(path):
+    return os.path.normcase(os.path.normpath(path))
 
 
 def load_config():
@@ -733,6 +781,18 @@ class App(tk.Tk):
         self._active_step_labels = self.step_labels
         self._active_steps = []
 
+        # Automated mode: every rat/session under a data root dated on or
+        # after a start date. _auto_items maps a session path key to its row
+        # in the sessions table; _auto_run is True while that mode's run is
+        # the one in flight (drives the determinate progress bar).
+        self.auto_step_vars = {}
+        self.auto_step_labels = {}
+        self._auto_items = {}
+        self._auto_status = {}
+        self._auto_rat_of = {}
+        self._auto_run = False
+        self._auto_scan_cache = None
+
         icon_path = os.path.join(APP_DIR, "lungs.ico")
         if os.path.isfile(icon_path):
             try:
@@ -758,6 +818,9 @@ class App(tk.Tk):
         self.group_radio = ttk.Radiobutton(mode_frame, text="Group Analysis", variable=self.mode_var,
                                             value="group", command=self._on_mode_change)
         self.group_radio.pack(side="left", padx=4)
+        self.auto_radio = ttk.Radiobutton(mode_frame, text="Automated", variable=self.mode_var,
+                                           value="auto", command=self._on_mode_change)
+        self.auto_radio.pack(side="left", padx=4)
 
         # Both mode frames are built up front and swapped in/out of this
         # container via pack/pack_forget in _on_mode_change, rather than
@@ -767,8 +830,10 @@ class App(tk.Tk):
         self.mode_container.pack(fill="x")
         self.single_frame = ttk.Frame(self.mode_container)
         self.group_frame = ttk.Frame(self.mode_container)
+        self.auto_frame = ttk.Frame(self.mode_container)
         self._build_single_ui(self.single_frame, pad)
         self._build_group_ui(self.group_frame, pad)
+        self._build_auto_ui(self.auto_frame, pad)
 
         server_frame = ttk.Frame(self)
         server_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -908,16 +973,200 @@ class App(tk.Tk):
         self.group_threshold_var = tk.StringVar(value=f"{self.cfg.get('group_threshold', DEFAULT_THRESHOLD):g}")
         ttk.Entry(thresh_row, textvariable=self.group_threshold_var, width=6).pack(side="left", padx=6)
 
+    def _build_auto_ui(self, parent, pad):
+        # Automated: every rat folder under one data root, every session
+        # dated on/after a start date, one rat at a time and one session at
+        # a time (pipeline_driver --data-root/--since -> run_group).
+        root_row = ttk.Frame(parent)
+        root_row.pack(fill="x", **pad)
+        ttk.Label(root_row, text="Data root:", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.auto_root_var = tk.StringVar(value=self.cfg.get("auto_root", DEFAULT_DATA_ROOT))
+        ttk.Entry(root_row, textvariable=self.auto_root_var, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=8)
+        ttk.Button(root_row, text="Browse...", command=self._browse_auto_root).pack(side="left")
+
+        date_row = ttk.Frame(parent)
+        date_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(date_row, text="Analyze sessions on or after (YYYY-MM-DD):").pack(side="left")
+        self.auto_since_var = tk.StringVar(value=self.cfg.get("auto_since", ""))
+        self.auto_since_combo = ttk.Combobox(date_row, textvariable=self.auto_since_var, width=12)
+        self.auto_since_combo.pack(side="left", padx=6)
+        self.auto_since_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_auto_sessions())
+        self.auto_since_combo.bind("<Return>", lambda e: self._refresh_auto_sessions())
+        self.auto_since_combo.bind("<FocusOut>", lambda e: self._refresh_auto_sessions())
+        ttk.Button(date_row, text="Find Sessions",
+                   command=lambda: self._refresh_auto_sessions(rescan=True)).pack(side="left")
+        self.auto_found_var = tk.StringVar()
+        ttk.Label(date_row, textvariable=self.auto_found_var, foreground="gray").pack(side="left", padx=8)
+
+        body = ttk.Frame(parent)
+        body.pack(fill="x", padx=10, pady=(0, 4))
+
+        steps_frame = ttk.LabelFrame(body, text="Steps to run (every session)")
+        steps_frame.pack(side="left", fill="y", padx=(0, 6))
+        saved_steps = set(self.cfg.get("auto_steps", [s[0] for s in ALL_STEPS]))
+        for key, label in ALL_STEPS:
+            var = tk.BooleanVar(value=key in saved_steps)
+            self.auto_step_vars[key] = var
+            row = ttk.Frame(steps_frame)
+            row.pack(fill="x", padx=6, pady=1, anchor="w")
+            ttk.Checkbutton(row, text=label.split("  (")[0], variable=var).pack(side="left")
+            status = ttk.Label(row, text="", width=10, foreground="gray")
+            status.pack(side="right")
+            self.auto_step_labels[key] = status
+
+        sessions_frame = ttk.LabelFrame(body, text="Animals / sessions")
+        sessions_frame.pack(side="left", fill="both", expand=True)
+        self.auto_progress_var = tk.StringVar(value="")
+        ttk.Label(sessions_frame, textvariable=self.auto_progress_var,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=6, pady=(4, 2))
+        self.auto_progressbar = ttk.Progressbar(sessions_frame, mode="determinate")
+        self.auto_progressbar.pack(fill="x", padx=6, pady=(0, 4))
+        tree_row = ttk.Frame(sessions_frame)
+        tree_row.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.auto_tree = ttk.Treeview(tree_row, columns=("rat", "session", "status"),
+                                      show="headings", height=9)
+        for col, text, width in (("rat", "Animal", 120), ("session", "Session", 150), ("status", "Status", 110)):
+            self.auto_tree.heading(col, text=text)
+            self.auto_tree.column(col, width=width, anchor="w")
+        self.auto_tree.tag_configure("pending", foreground="gray")
+        self.auto_tree.tag_configure("running", foreground="#c80")
+        self.auto_tree.tag_configure("done", foreground="#0a5")
+        self.auto_tree.tag_configure("skipped", foreground="#08c")
+        self.auto_tree.tag_configure("failed", foreground="#c00")
+        self.auto_tree.tag_configure("stopped", foreground="#c00")
+        tree_scroll = ttk.Scrollbar(tree_row, orient="vertical", command=self.auto_tree.yview)
+        self.auto_tree.configure(yscrollcommand=tree_scroll.set)
+        self.auto_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="left", fill="y")
+
+        opt_row = ttk.Frame(parent)
+        opt_row.pack(fill="x", padx=16, pady=(0, 6))
+        ttk.Label(opt_row, text="Projection threshold (every session):").pack(side="left")
+        self.auto_threshold_var = tk.StringVar(value=f"{self.cfg.get('auto_threshold', DEFAULT_THRESHOLD):g}")
+        ttk.Entry(opt_row, textvariable=self.auto_threshold_var, width=6).pack(side="left", padx=6)
+        self.auto_skip_done_var = tk.BooleanVar(value=bool(self.cfg.get("auto_skip_done", False)))
+        ttk.Checkbutton(opt_row, text="Skip steps a session already has recorded as done",
+                        variable=self.auto_skip_done_var).pack(side="left", padx=(16, 0))
+
+        self._refresh_auto_sessions(rescan=True)
+
+    def _browse_auto_root(self):
+        initial = self.auto_root_var.get() or DEFAULT_DATA_ROOT
+        if not os.path.isdir(initial):
+            initial = os.path.expanduser("~")
+        chosen = filedialog.askdirectory(title=r"Select the folder holding every rat folder (e.g. D:\Data)",
+                                          initialdir=initial)
+        if chosen:
+            self.auto_root_var.set(os.path.normpath(chosen))
+            self.cfg["auto_root"] = self.auto_root_var.get()
+            save_config(self.cfg)
+            self._refresh_auto_sessions(rescan=True)
+
+    def _refresh_auto_sessions(self, rescan=False):
+        """Re-lists the sessions the Automated run would process for the
+        current data root and start date. Not while a run is in flight -
+        the table is that run's live progress then."""
+        if self.running and self._auto_run:
+            return
+        root = self.auto_root_var.get().strip()
+        if rescan or self._auto_scan_cache is None or self._auto_scan_cache[0] != root:
+            self._auto_scan_cache = (root, scan_data_root(root) if os.path.isdir(root) else {})
+        scan = self._auto_scan_cache[1]
+        dates = sorted({d for sessions in scan.values() for d, _ in sessions}, reverse=True)
+        self.auto_since_combo.config(values=dates)
+
+        since = parse_start_date(self.auto_since_var.get())
+        plan = []
+        if since:
+            for rat_dir, sessions in scan.items():
+                plan += [s for d, s in sessions if d >= since]
+        self._set_auto_plan(plan)
+        if not os.path.isdir(root):
+            self.auto_found_var.set("data root not found")
+        elif not self.auto_since_var.get().strip():
+            self.auto_found_var.set("type or pick a start date")
+        elif not since:
+            self.auto_found_var.set("not a valid date (use YYYY-MM-DD)")
+        else:
+            rats = {os.path.dirname(p) for p in plan}
+            self.auto_found_var.set(f"{len(plan)} session{'s' if len(plan) != 1 else ''} in "
+                                    f"{len(rats)} animal{'s' if len(rats) != 1 else ''}")
+
+    def _set_auto_plan(self, session_dirs):
+        self.auto_tree.delete(*self.auto_tree.get_children())
+        self._auto_items, self._auto_status, self._auto_rat_of = {}, {}, {}
+        for path in session_dirs:
+            self._auto_add_plan_item(path)
+        self._update_auto_progress()
+
+    def _auto_add_plan_item(self, path):
+        key = _path_key(path)
+        if key in self._auto_items:
+            return
+        rat = os.path.basename(os.path.dirname(os.path.normpath(path)))
+        session = os.path.basename(os.path.normpath(path))
+        self._auto_items[key] = self.auto_tree.insert("", "end", values=(rat, session, "pending"),
+                                                      tags=("pending",))
+        self._auto_status[key] = "pending"
+        self._auto_rat_of[key] = rat
+
+    def _set_auto_status(self, path_text, status, label=None):
+        """Finds the planned session whose path path_text starts with (lines
+        like 'D:\\Data\\R53\\2026-10-06_12h54 (3/12)' or '...: error')."""
+        text = _path_key(path_text)
+        key = next((k for k in sorted(self._auto_items, key=len, reverse=True) if text.startswith(k)), None)
+        if key is None:
+            return
+        self._auto_status[key] = status
+        item = self._auto_items[key]
+        self.auto_tree.item(item, values=(self.auto_tree.set(item, "rat"), self.auto_tree.set(item, "session"),
+                                          label or status), tags=(status,))
+        if status == "running":
+            self.auto_tree.see(item)
+        self._update_auto_progress()
+
+    def _update_auto_progress(self):
+        statuses = list(self._auto_status.values())
+        total = len(statuses)
+        finished = {"done", "skipped", "failed"}   # "stopped" still needs analyzing
+        n_done = statuses.count("done")
+        n_skipped = statuses.count("skipped")
+        n_failed = statuses.count("failed")
+        n_finished = sum(1 for st in statuses if st in finished)
+        rats = {}
+        for key, st in self._auto_status.items():
+            rats.setdefault(self._auto_rat_of[key], []).append(st)
+        rats_finished = sum(1 for sts in rats.values() if all(st in finished for st in sts))
+        self.auto_progressbar.config(maximum=max(total, 1), value=n_finished)
+        if not total:
+            self.auto_progress_var.set("No sessions selected.")
+            return
+        parts = [f"Sessions: {n_finished}/{total} analyzed, {total - n_finished} remaining"]
+        extra = []
+        if n_done:
+            extra.append(f"{n_done} done")
+        if n_skipped:
+            extra.append(f"{n_skipped} already done")
+        if n_failed:
+            extra.append(f"{n_failed} failed")
+        if statuses.count("stopped"):
+            extra.append(f"{statuses.count('stopped')} stopped")
+        if extra:
+            parts[0] += f" ({', '.join(extra)})"
+        parts.append(f"Animals: {rats_finished}/{len(rats)} finished, {len(rats) - rats_finished} remaining")
+        self.auto_progress_var.set("   |   ".join(parts))
+
     def _on_mode_change(self):
         mode = self.mode_var.get()
+        for frame in (self.single_frame, self.group_frame, self.auto_frame):
+            frame.pack_forget()
         if mode == "single":
-            self.group_frame.pack_forget()
             self.single_frame.pack(fill="x")
             self.thresh_btn.config(state="normal")
             self._refresh_threshold_label()
         else:
-            self.single_frame.pack_forget()
-            self.group_frame.pack(fill="x")
+            (self.group_frame if mode == "group" else self.auto_frame).pack(fill="x")
             self.thresh_btn.config(state="disabled")
             self.thresh_var.set("")
         self.cfg["mode"] = mode
@@ -940,6 +1189,12 @@ class App(tk.Tk):
                 os.startfile(d)
             else:
                 messagebox.showinfo("FMIG Rat Reconstruction", "Pick a data folder first.")
+        elif self.mode_var.get() == "auto":
+            d = self.auto_root_var.get()
+            if d and os.path.isdir(d):
+                os.startfile(d)
+            else:
+                messagebox.showinfo("FMIG Rat Reconstruction", "Pick a data root first.")
         else:
             if self.group_rats:
                 os.startfile(self.group_rats[-1])
@@ -1167,7 +1422,55 @@ class App(tk.Tk):
 
         mode = self.mode_var.get()
         want_lr_editor = False
-        if mode == "single":
+        self._auto_run = False
+        if mode == "auto":
+            root = self.auto_root_var.get().strip()
+            if not root or not os.path.isdir(root):
+                messagebox.showerror("FMIG Rat Reconstruction", "Choose a valid data root first.")
+                return
+            since = parse_start_date(self.auto_since_var.get())
+            if not since:
+                messagebox.showerror("FMIG Rat Reconstruction",
+                                     "Enter a start date as YYYY-MM-DD, or pick one from the list.")
+                return
+            steps = self._selected_steps(self.auto_step_vars)
+            if not steps:
+                messagebox.showerror("FMIG Rat Reconstruction", "Select at least one step to run.")
+                return
+            self._refresh_auto_sessions(rescan=True)
+            n = len(self._auto_items)
+            if not n:
+                messagebox.showinfo("FMIG Rat Reconstruction",
+                                    f"No session folders dated on or after {since} under {root}.")
+                return
+            n_rats = len(set(self._auto_rat_of.values()))
+            if not messagebox.askyesno(
+                    "FMIG Rat Reconstruction",
+                    f"Run {len(steps)} step{'s' if len(steps) != 1 else ''} on {n} session"
+                    f"{'s' if n != 1 else ''} across {n_rats} animal{'s' if n_rats != 1 else ''}, "
+                    f"one at a time?"):
+                return
+            try:
+                threshold = float(self.auto_threshold_var.get())
+            except ValueError:
+                threshold = DEFAULT_THRESHOLD
+            threshold = min(1.0, max(0.01, threshold))
+
+            self.cfg["auto_root"] = root
+            self.cfg["auto_since"] = since
+            self.cfg["auto_steps"] = steps
+            self.cfg["auto_threshold"] = threshold
+            self.cfg["auto_skip_done"] = bool(self.auto_skip_done_var.get())
+            save_config(self.cfg)
+
+            self.auto_since_var.set(since)
+            self._auto_run = True
+            active_labels = self.auto_step_labels
+            cmd = [python_exe, "-u", DRIVER, "--data-root", root, "--since", since,
+                   "--steps", ",".join(steps), "--threshold", f"{threshold:g}"]
+            if self.auto_skip_done_var.get():
+                cmd.append("--skip-done")
+        elif mode == "single":
             main_dir = self.dir_var.get().strip()
             if not main_dir or not os.path.isdir(main_dir):
                 messagebox.showerror("FMIG Rat Reconstruction", "Please choose a valid data folder first.")
@@ -1267,6 +1570,7 @@ class App(tk.Tk):
         self.stop_btn.config(state="normal")
         self.single_radio.config(state="disabled")
         self.group_radio.config(state="disabled")
+        self.auto_radio.config(state="disabled")
         self.status_var.set("Running...")
         self.progress.start(12)
 
@@ -1347,6 +1651,21 @@ class App(tk.Tk):
             # refused to silently substitute the fallback template - ask the
             # user in _handle_exit, once the (failed) run has fully stopped.
             self._pending_timing_fallback_msg = line.split("===TIMING_FALLBACK_NEEDED=== ", 1)[1].strip()
+        elif self._auto_run and line.startswith("===GROUP_START=== "):
+            self._set_auto_plan([])
+        elif self._auto_run and line.startswith("===PLAN=== "):
+            self._auto_add_plan_item(line.split("===PLAN=== ", 1)[1].strip())
+            self._update_auto_progress()
+        elif self._auto_run and line.startswith("===SESSION_DONE=== "):
+            self._set_auto_status(line.split("===SESSION_DONE=== ", 1)[1].strip(), "done")
+        elif self._auto_run and line.startswith("===SESSION_FAILED=== "):
+            self._set_auto_status(line.split("===SESSION_FAILED=== ", 1)[1].strip(), "failed", "FAILED")
+        elif self._auto_run and line.startswith("===SESSION_SKIPPED=== "):
+            self._set_auto_status(line.split("===SESSION_SKIPPED=== ", 1)[1].strip(), "skipped",
+                                  "already done")
+            for key in self._active_steps:
+                if key in labels:
+                    labels[key].config(text="already done", foreground="#08c")
         elif line.startswith("===SESSION=== "):
             # Group mode: a new session is starting - reset this run's step
             # labels back to "queued" so a status left over from the
@@ -1354,6 +1673,8 @@ class App(tk.Tk):
             # if it already applied to the new one.
             rest = line.split("===SESSION=== ", 1)[1].strip()
             self.status_var.set(f"Running: {rest}")
+            if self._auto_run:
+                self._set_auto_status(rest, "running", "running...")
             for key in self._active_steps:
                 if key in labels:
                     labels[key].config(text="queued", foreground="gray")
@@ -1368,7 +1689,15 @@ class App(tk.Tk):
         self.stop_btn.config(state="disabled")
         self.single_radio.config(state="normal")
         self.group_radio.config(state="normal")
+        self.auto_radio.config(state="normal")
         self.progress.stop()
+        if self._auto_run:
+            # A session cut off by Stop (or a crash) is marked as such; the
+            # ones never reached stay "pending" so the counts show what is left.
+            for key, st in list(self._auto_status.items()):
+                if st == "running":
+                    self._set_auto_status(key, "stopped", "stopped")
+            self._auto_run = False
         if code == 0:
             self.status_var.set("Finished successfully.")
         else:
