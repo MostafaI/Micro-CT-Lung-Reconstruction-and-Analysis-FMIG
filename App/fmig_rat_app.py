@@ -874,7 +874,8 @@ class App(tk.Tk):
 
         # Packed before the expanding log/preview area so it always stays
         # visible at the bottom, whatever the window size.
-        ttk.Label(self, text="Developed by Mostafa Ismail as part of his PhD research at FMIG (2020–2026).",
+        ttk.Label(self, text="Developed by Mostafa Ismail during his PhD research  |  Functional and Metabolic "
+                       "Imaging Group (FMIG)  |  University of Pennsylvania  |  2020–2026",
                   foreground="gray", font=("Segoe UI", 8)).pack(side="bottom", pady=(0, 4))
 
         body = ttk.PanedWindow(self, orient="horizontal")
