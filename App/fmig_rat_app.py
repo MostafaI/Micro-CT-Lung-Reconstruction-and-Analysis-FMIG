@@ -872,6 +872,11 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(self, mode="indeterminate")
         self.progress.pack(fill="x", padx=10)
 
+        # Packed before the expanding log/preview area so it always stays
+        # visible at the bottom, whatever the window size.
+        ttk.Label(self, text="Developed by Mostafa Ismail as part of his PhD research at FMIG (2020–2026).",
+                  foreground="gray", font=("Segoe UI", 8)).pack(side="bottom", pady=(0, 4))
+
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, **pad)
 
